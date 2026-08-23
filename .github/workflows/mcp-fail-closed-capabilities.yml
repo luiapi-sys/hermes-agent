@@ -54,12 +54,12 @@ jobs:
               "trusted get_tool_definitions kwargs",
           )
 
-          replace_once(
-              "tests/agent/transports/test_hermes_tools_mcp_policy.py",
-              '        "memory": set(),\n',
-              '        "memory": {ToolCapability.MCP_SAFE},\n',
-              "memory explicit-safe expectation",
-          )
+          p = Path("tests/agent/transports/test_hermes_tools_mcp_policy.py")
+          text = p.read_text()
+          old = '        "memory": set(),\n'
+          if old not in text:
+              raise RuntimeError("legacy memory expectation not found")
+          p.write_text(text.replace(old, '        "memory": {ToolCapability.MCP_SAFE},\n', 1))
           PY
 
       - name: Install uv
