@@ -1,0 +1,52 @@
+name: MCP Bridge Targeted
+
+on:
+  push:
+    branches:
+      - feat/hermes-mcp-full-tools
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-bridge-targeted-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: MCP bridge targeted tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Run targeted MCP bridge tests
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          HERMES_MCP_DISCOVER_EXTERNAL: "0"
+        run: |
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/agent/transports/test_hermes_tools_mcp_server.py \
+            tests/agent/transports/test_hermes_tools_mcp_context.py \
+            tests/agent/transports/test_hermes_tools_mcp_agent_loop_routing.py
