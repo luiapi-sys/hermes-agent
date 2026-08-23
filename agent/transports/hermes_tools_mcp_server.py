@@ -287,6 +287,7 @@ def _discover_external_mcp_tools(
     mode: str,
     *,
     enabled: bool | None = None,
+    allow_native_execution: bool = False,
 ) -> None:
     """Discover configured external MCP tools before the full-mode snapshot.
 
@@ -304,6 +305,12 @@ def _discover_external_mcp_tools(
         enabled = _resolve_discover_external()
     if not enabled:
         logger.info("external MCP discovery disabled by config")
+        return
+    if not allow_native_execution:
+        logger.info(
+            "external MCP discovery suppressed because "
+            "allow_native_execution is false"
+        )
         return
 
     try:
@@ -349,7 +356,11 @@ def _build_server() -> Any:
     # model_tools deliberately does not discover configured MCP servers at
     # import time. Full mode is a dedicated MCP process with a static tool list,
     # so discovery must finish before taking the authoritative registry snapshot.
-    _discover_external_mcp_tools(mode, enabled=discover_external)
+    _discover_external_mcp_tools(
+        mode,
+        enabled=discover_external,
+        allow_native_execution=allow_native_execution,
+    )
 
     # Always request the raw pre-Tool-Search catalog. Otherwise progressive
     # disclosure can replace real tools with tool_search/tool_describe/tool_call
