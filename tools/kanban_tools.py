@@ -35,7 +35,7 @@ from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
-from tools.registry import registry, tool_error
+from tools.registry import ToolCapability, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
@@ -2071,6 +2071,7 @@ registry.register(
     schema=KANBAN_COMPLETE_SCHEMA,
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
+    capabilities={ToolCapability.SPAWN_WORKER},
     emoji="✔",
 )
 
@@ -2134,6 +2135,7 @@ registry.register(
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
     check_fn=_check_kanban_mode,
+    capabilities={ToolCapability.SPAWN_WORKER},
     emoji="➕",
 )
 
@@ -2143,6 +2145,7 @@ registry.register(
     schema=KANBAN_UNBLOCK_SCHEMA,
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
+    capabilities={ToolCapability.SPAWN_WORKER},
     emoji="▶",
 )
 
