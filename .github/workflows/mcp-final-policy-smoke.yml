@@ -1,0 +1,245 @@
+name: MCP Final Policy Smoke
+
+on:
+  pull_request:
+    branches:
+      - fix/mcp-full-policy-hardening
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Final capability + real stdio MCP policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HERMES_INTERACTIVE: "1"
+      HERMES_KANBAN_TASK: "mcp-final-policy-smoke"
+    steps:
+      - name: Checkout exact validation snapshot
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Run focused MCP policy tests
+        run: |
+          uv run pytest -q \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/agent/transports/test_hermes_tools_mcp_server.py \
+            tests/agent/transports/test_hermes_tools_mcp_agent_loop_routing.py \
+            tests/agent/transports/test_hermes_tools_mcp_context.py \
+            tests/tools/test_mcp_tool.py
+
+      - name: Verify registry capability invariants
+        run: |
+          uv run python - <<'PY'
+          import model_tools  # noqa: F401 - populate registry
+          from agent.transports.hermes_tools_mcp_server import _MCP_UNSAFE_CAPABILITIES
+          from tools.registry import ToolCapability, registry
+
+          expected = {
+              "terminal": ToolCapability.HOST_EXECUTION,
+              "process": ToolCapability.PROCESS_CONTROL,
+              "read_file": ToolCapability.FILESYSTEM_ACCESS,
+              "write_file": ToolCapability.FILESYSTEM_ACCESS,
+              "patch": ToolCapability.FILESYSTEM_ACCESS,
+              "search_files": ToolCapability.FILESYSTEM_ACCESS,
+              "execute_code": ToolCapability.HOST_EXECUTION,
+              "computer_use": ToolCapability.UI_AUTOMATION,
+              "delegate_task": ToolCapability.SPAWN_AGENT,
+              "cronjob": ToolCapability.SPAWN_AGENT,
+              "kanban_create": ToolCapability.SPAWN_WORKER,
+              "kanban_unblock": ToolCapability.SPAWN_WORKER,
+              "kanban_complete": ToolCapability.SPAWN_WORKER,
+          }
+          for name, capability in expected.items():
+              caps = registry.get_tool_capabilities(name)
+              assert capability in caps, (name, capability, sorted(caps))
+          assert ToolCapability.EXTERNAL_MCP in _MCP_UNSAFE_CAPABILITIES
+          print("MCP_FINAL_CAPABILITY_METADATA_OK")
+          PY
+
+      - name: Ruff MCP hardening files
+        run: |
+          uv run ruff check \
+            tools/registry.py \
+            tools/kanban_tools.py \
+            tools/mcp_tool.py \
+            agent/transports/hermes_tools_mcp_server.py \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/agent/transports/test_hermes_tools_mcp_server.py \
+            tests/tools/test_mcp_tool.py
+
+      - name: Real stdio safe and trusted policy smoke
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-final-policy-smoke
+          HERMES_MCP_SESSION_ID: mcp-final-policy-smoke
+          HERMES_YOLO_MODE: "1"
+          HERMES_ACCEPT_HOOKS: "1"
+          MCP_SMOKE_SENTINEL: ${{ runner.temp }}/external-mcp-launched.txt
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          mkdir -p "$HERMES_HOME"
+
+          cat > "$RUNNER_TEMP/ext_mcp.py" <<'PY'
+          import os
+          from pathlib import Path
+          from mcp.server.fastmcp import FastMCP
+
+          sentinel = os.environ.get("MCP_SMOKE_SENTINEL")
+          if sentinel:
+              Path(sentinel).write_text("launched")
+
+          mcp = FastMCP("final-policy-smoke-external")
+
+          @mcp.tool()
+          def ext_echo(text: str) -> str:
+              return f"EXT:{text}"
+
+          if __name__ == "__main__":
+              mcp.run()
+          PY
+
+          write_config() {
+            local native="$1"
+            cat > "$HERMES_HOME/config.yaml" <<YAML
+          mcp:
+            hermes_tools:
+              mode: full
+              discover_external: true
+              allow_native_execution: ${native}
+          mcp_servers:
+            smoke_external:
+              command: "${GITHUB_WORKSPACE}/.venv/bin/python"
+              args:
+                - "${RUNNER_TEMP}/ext_mcp.py"
+              env:
+                MCP_SMOKE_SENTINEL: "${MCP_SMOKE_SENTINEL}"
+              connect_timeout: 15
+              timeout: 30
+          YAML
+          }
+
+          source .venv/bin/activate
+
+          rm -f "$MCP_SMOKE_SENTINEL"
+          write_config false
+          python - <<'PY'
+          import asyncio
+          import os
+          from pathlib import Path
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          FORBIDDEN = {
+              "terminal", "process", "read_file", "write_file", "patch",
+              "search_files", "execute_code", "computer_use", "delegate_task",
+              "cronjob", "kanban_create", "kanban_unblock", "kanban_complete",
+          }
+
+          async def main():
+              params = StdioServerParameters(
+                  command=str(Path.cwd() / ".venv" / "bin" / "python"),
+                  args=["-m", "agent.transports.hermes_tools_mcp_server", "--verbose"],
+                  env=dict(os.environ),
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      names = {tool.name for tool in (await session.list_tools()).tools}
+                      leaked = sorted(names & FORBIDDEN)
+                      assert not leaked, f"unsafe capabilities leaked into safe-full: {leaked}"
+                      external = sorted(n for n in names if "ext_echo" in n or n.startswith("mcp__smoke_external__"))
+                      assert not external, f"external MCP leaked into safe-full: {external}"
+                      for required in ("memory", "session_search", "todo"):
+                          assert required in names, f"missing safe tool: {required}"
+                      assert not Path(os.environ["MCP_SMOKE_SENTINEL"]).exists(), (
+                          "safe-full launched configured external stdio MCP process"
+                      )
+                      print(f"SAFE_FULL count={len(names)}")
+                      print("MCP_FINAL_SAFE_OK")
+
+          asyncio.run(main())
+          PY
+
+          test ! -e "$MCP_SMOKE_SENTINEL"
+
+          rm -f "$MCP_SMOKE_SENTINEL"
+          write_config true
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+          from pathlib import Path
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          def result_text(result):
+              return "\n".join(getattr(item, "text", "") for item in result.content)
+
+          async def main():
+              params = StdioServerParameters(
+                  command=str(Path.cwd() / ".venv" / "bin" / "python"),
+                  args=["-m", "agent.transports.hermes_tools_mcp_server", "--verbose"],
+                  env=dict(os.environ),
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                      for required in (
+                          "terminal", "process", "read_file", "write_file", "patch",
+                          "execute_code", "memory", "session_search", "todo",
+                          "delegate_task", "cronjob", "kanban_create",
+                          "kanban_unblock", "kanban_complete",
+                      ):
+                          assert required in tools, f"missing trusted tool: {required}"
+                      external = next((n for n in tools if "ext_echo" in n), None)
+                      assert external, "trusted-full did not discover external MCP tool"
+                      assert Path(os.environ["MCP_SMOKE_SENTINEL"]).exists(), (
+                          "trusted-full did not launch configured external stdio MCP process"
+                      )
+
+                      schema = getattr(tools["terminal"], "inputSchema", None) or {}
+                      props = schema.get("properties") or {}
+                      if "command" in props:
+                          args = {"command": "printf mcp-final-terminal"}
+                      elif "commands" in props:
+                          spec = props["commands"] or {}
+                          args = {
+                              "commands": ["printf mcp-final-terminal"]
+                              if spec.get("type") == "array"
+                              else "printf mcp-final-terminal"
+                          }
+                      else:
+                          raise AssertionError(f"unexpected terminal schema: {json.dumps(schema)}")
+
+                      terminal = await session.call_tool("terminal", args)
+                      assert "mcp-final-terminal" in result_text(terminal)
+                      ext = await session.call_tool(external, {"text": "trusted"})
+                      assert "EXT:trusted" in result_text(ext)
+                      print(f"TRUSTED_FULL count={len(tools)}")
+                      print("MCP_FINAL_TRUSTED_OK")
+
+          asyncio.run(main())
+          PY
+
+          test -e "$MCP_SMOKE_SENTINEL"
