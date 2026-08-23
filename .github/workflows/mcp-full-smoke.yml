@@ -1,0 +1,165 @@
+name: MCP Full Surface Smoke
+
+on:
+  push:
+    branches:
+      - test/mcp-full-smoke
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Real stdio MCP smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout feature snapshot
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Smoke real Hermes MCP subprocess
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-smoke
+          HERMES_MCP_MODE: full
+          HERMES_MCP_DISCOVER_EXTERNAL: "1"
+          HERMES_MCP_SESSION_ID: mcp-smoke-session
+          HERMES_YOLO_MODE: "1"
+          HERMES_ACCEPT_HOOKS: "1"
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          mkdir -p "$HERMES_HOME"
+          cat > "$RUNNER_TEMP/ext_mcp.py" <<'PY'
+          from mcp.server.fastmcp import FastMCP
+
+          mcp = FastMCP("smoke-external")
+
+          @mcp.tool()
+          def ext_echo(text: str) -> str:
+              return f"EXT:{text}"
+
+          if __name__ == "__main__":
+              mcp.run()
+          PY
+
+          cat > "$HERMES_HOME/config.yaml" <<YAML
+          mcp_servers:
+            smoke_external:
+              command: "${GITHUB_WORKSPACE}/.venv/bin/python"
+              args:
+                - "${RUNNER_TEMP}/ext_mcp.py"
+              connect_timeout: 15
+              timeout: 30
+          YAML
+
+          source .venv/bin/activate
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+          from pathlib import Path
+
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          def result_text(result):
+              chunks = []
+              for item in getattr(result, "content", []) or []:
+                  text = getattr(item, "text", None)
+                  if text is not None:
+                      chunks.append(text)
+              return "\n".join(chunks)
+
+          async def main():
+              python = str(Path.cwd() / ".venv" / "bin" / "python")
+              params = StdioServerParameters(
+                  command=python,
+                  args=["-m", "agent.transports.hermes_tools_mcp_server", "--verbose"],
+                  env=dict(os.environ),
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      listed = await session.list_tools()
+                      tools = {tool.name: tool for tool in listed.tools}
+                      names = set(tools)
+                      print(f"tools/list count={len(names)}")
+
+                      required = {"todo", "memory", "session_search", "delegate_task", "terminal"}
+                      missing = sorted(required - names)
+                      assert not missing, f"missing full-mode Hermes tools: {missing}"
+
+                      external = next((name for name in names if "ext_echo" in name), None)
+                      assert external, f"external MCP tool ext_echo not discovered; names={sorted(names)}"
+
+                      write_result = await session.call_tool(
+                          "todo",
+                          {
+                              "todos": [
+                                  {"id": "smoke-1", "content": "verify MCP bridge", "status": "in_progress"}
+                              ]
+                          },
+                      )
+                      write_text = result_text(write_result)
+                      assert "smoke-1" in write_text, write_text
+
+                      read_result = await session.call_tool("todo", {})
+                      read_text = result_text(read_result)
+                      assert "smoke-1" in read_text, read_text
+
+                      memory_result = await session.call_tool(
+                          "memory",
+                          {"action": "add", "target": "memory", "content": "MCP bridge smoke marker"},
+                      )
+                      memory_text = result_text(memory_result)
+                      assert "Memory is not available" not in memory_text, memory_text
+                      assert "must be handled by the agent loop" not in memory_text, memory_text
+
+                      search_result = await session.call_tool("session_search", {})
+                      search_text = result_text(search_result)
+                      assert "Session database not available" not in search_text, search_text
+                      assert "must be handled by the agent loop" not in search_text, search_text
+
+                      terminal_schema = getattr(tools["terminal"], "inputSchema", None) or {}
+                      props = terminal_schema.get("properties") or {}
+                      if "command" in props:
+                          terminal_args = {"command": "printf mcp-smoke-terminal"}
+                      elif "commands" in props:
+                          spec = props["commands"] or {}
+                          terminal_args = {
+                              "commands": ["printf mcp-smoke-terminal"]
+                              if spec.get("type") == "array"
+                              else "printf mcp-smoke-terminal"
+                          }
+                      else:
+                          raise AssertionError(f"unexpected terminal schema: {json.dumps(terminal_schema)}")
+                      terminal_result = await session.call_tool("terminal", terminal_args)
+                      terminal_text = result_text(terminal_result)
+                      assert "mcp-smoke-terminal" in terminal_text, terminal_text
+
+                      external_result = await session.call_tool(external, {"text": "ping"})
+                      external_text = result_text(external_result)
+                      assert "EXT:ping" in external_text, external_text
+
+                      print("MCP_FULL_SMOKE_OK")
+
+          asyncio.run(main())
+          PY
