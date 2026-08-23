@@ -55,11 +55,26 @@ def test_execution_and_remote_mutation_toolsets_inherit_fail_closed_capabilities
             ToolCapability.HOST_EXECUTION,
             ToolCapability.PROCESS_CONTROL,
         },
+        "browser-cdp": {
+            ToolCapability.UI_AUTOMATION,
+            ToolCapability.HOST_EXECUTION,
+            ToolCapability.PROCESS_CONTROL,
+        },
         "tts": {
             ToolCapability.FILESYSTEM_ACCESS,
             ToolCapability.HOST_EXECUTION,
             ToolCapability.PROCESS_CONTROL,
         },
+        "image_gen": {
+            ToolCapability.FILESYSTEM_ACCESS,
+            ToolCapability.EXTERNAL_SIDE_EFFECT,
+        },
+        "video_gen": {
+            ToolCapability.FILESYSTEM_ACCESS,
+            ToolCapability.EXTERNAL_SIDE_EFFECT,
+        },
+        "skills": {ToolCapability.FILESYSTEM_ACCESS},
+        "project": {ToolCapability.FILESYSTEM_ACCESS},
         "discord": {ToolCapability.EXTERNAL_SIDE_EFFECT},
         "discord_admin": {ToolCapability.EXTERNAL_SIDE_EFFECT},
         "homeassistant": {ToolCapability.EXTERNAL_SIDE_EFFECT},
