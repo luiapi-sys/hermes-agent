@@ -5500,7 +5500,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     Returns:
         List of registered prefixed tool names.
     """
-    from tools.registry import registry
+    from tools.registry import ToolCapability, registry
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
@@ -5552,6 +5552,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            capabilities={ToolCapability.EXTERNAL_MCP},
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
@@ -5589,6 +5590,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            capabilities={ToolCapability.EXTERNAL_MCP},
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)

@@ -27,6 +27,37 @@ from typing import Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 
+class ToolCapability:
+    """Security-relevant capabilities carried by registered tools.
+
+    These are intentionally coarse. Transports can deny capability classes
+    without knowing concrete tool names, so future tools inherit the correct
+    boundary from their toolset or explicit registration metadata.
+    """
+
+    HOST_EXECUTION = "host_execution"
+    FILESYSTEM_ACCESS = "filesystem_access"
+    PROCESS_CONTROL = "process_control"
+    UI_AUTOMATION = "ui_automation"
+    SPAWN_AGENT = "spawn_agent"
+    SPAWN_WORKER = "spawn_worker"
+    EXTERNAL_MCP = "external_mcp"
+
+
+_TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
+    "terminal": frozenset(
+        {ToolCapability.HOST_EXECUTION, ToolCapability.PROCESS_CONTROL}
+    ),
+    "file": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "code_execution": frozenset({ToolCapability.HOST_EXECUTION}),
+    "computer_use": frozenset(
+        {ToolCapability.UI_AUTOMATION, ToolCapability.HOST_EXECUTION}
+    ),
+    "delegation": frozenset({ToolCapability.SPAWN_AGENT}),
+    "cronjob": frozenset({ToolCapability.SPAWN_AGENT}),
+}
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -90,12 +121,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "capabilities",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 capabilities=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -105,6 +137,7 @@ class ToolEntry:
         self.is_async = is_async
         self.description = description
         self.emoji = emoji
+        self.capabilities = frozenset(capabilities or ())
         self.max_result_size_chars = max_result_size_chars
         # Optional zero-arg callable returning a dict of schema overrides
         # applied at get_definitions() time. Use for fields that depend on
@@ -276,6 +309,11 @@ class ToolRegistry:
         with self._lock:
             return self._tools.get(name)
 
+    def get_tool_capabilities(self, name: str) -> frozenset[str]:
+        """Return immutable security capabilities for a registered tool."""
+        entry = self.get_entry(name)
+        return entry.capabilities if entry is not None else frozenset()
+
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
         return sorted({entry.toolset for entry in self._snapshot_entries()})
@@ -375,6 +413,7 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        capabilities: Set[str] = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -385,6 +424,9 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        resolved_capabilities = frozenset(
+            _TOOLSET_DEFAULT_CAPABILITIES.get(toolset, frozenset())
+        ).union(capabilities or ())
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -443,6 +485,7 @@ class ToolRegistry:
                 is_async=is_async,
                 description=description or schema.get("description", ""),
                 emoji=emoji,
+                capabilities=resolved_capabilities,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
             )

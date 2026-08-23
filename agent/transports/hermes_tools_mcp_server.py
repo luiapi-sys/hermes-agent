@@ -4,25 +4,36 @@ When the user runs `openai/*` turns through the codex app-server, codex
 owns the loop and builds its own tool list. By default, that means
 Hermes' richer tool surface is unreachable unless it is bridged through MCP.
 
-This module supports two exposure modes controlled by ``HERMES_MCP_MODE``:
+User-facing behavior is configured in ``config.yaml`` under
+``mcp.hermes_tools``::
 
-``curated`` (default)
+    mcp:
+      hermes_tools:
+        mode: full
+        discover_external: true
+        allow_native_execution: false
+
+``mode: curated`` (default)
     Preserve the historical Codex-oriented allowlist. Tools that duplicate
     Codex built-ins remain hidden and agent-loop tools stay out of the MCP
     surface.
 
-``full``
-    Expose every Hermes tool definition that is currently available from the
-    registry. Configured external MCP servers are discovered before the raw
-    pre-Tool-Search catalog is snapshotted, so plugin/MCP tools are included as
-    well as built-ins. Availability checks still apply. The four agent-loop
-    tools (``delegate_task``, ``memory``, ``session_search`` and ``todo``) are
-    routed through a dedicated MCP context bridge while still executing through
-    ``model_tools.handle_function_call()``.
+``mode: full``
+    Expose every currently available Hermes tool definition from the registry,
+    including configured external MCP tools and the stateful agent-loop tools
+    supported by the MCP context bridge.
 
-External MCP discovery is enabled by default in full mode. Set
-``HERMES_MCP_DISCOVER_EXTERNAL=0`` to skip it when fast/offline startup is more
-important than a complete configured MCP surface.
+For security, full mode filters registry tools carrying host-execution,
+filesystem, process-control, UI-automation, agent-spawn, worker-spawn, or
+external-MCP capabilities by default. Classification lives in the central tool registry so
+future tools inherit the boundary from their toolset or explicit metadata. A
+trusted external MCP deployment (for example a dedicated ChatGPT remote MCP
+gateway) that intentionally wants the complete native surface must also set
+``mcp.hermes_tools.allow_native_execution: true``.
+
+``HERMES_MCP_MODE``, ``HERMES_MCP_DISCOVER_EXTERNAL`` and
+``HERMES_MCP_ALLOW_NATIVE_EXECUTION`` remain supported as process-local/internal
+or legacy overrides, but behavioral configuration should live in config.yaml.
 
 Run with: python -m agent.transports.hermes_tools_mcp_server
 Spawned by: CodexAppServerSession.ensure_started() when the runtime is active
@@ -36,15 +47,32 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Collection, Mapping, Optional
+
+from tools.registry import ToolCapability, registry
 
 logger = logging.getLogger(__name__)
 
 MCP_MODE_ENV = "HERMES_MCP_MODE"
 MCP_DISCOVER_EXTERNAL_ENV = "HERMES_MCP_DISCOVER_EXTERNAL"
+MCP_ALLOW_NATIVE_EXECUTION_ENV = "HERMES_MCP_ALLOW_NATIVE_EXECUTION"
 MCP_MODE_CURATED = "curated"
 MCP_MODE_FULL = "full"
 _VALID_MCP_MODES = {MCP_MODE_CURATED, MCP_MODE_FULL}
+
+# Security capabilities that can escape a coding client's own sandbox or
+# approval boundary. The registry, not this transport, owns tool classification.
+_MCP_UNSAFE_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        ToolCapability.HOST_EXECUTION,
+        ToolCapability.FILESYSTEM_ACCESS,
+        ToolCapability.PROCESS_CONTROL,
+        ToolCapability.UI_AUTOMATION,
+        ToolCapability.SPAWN_AGENT,
+        ToolCapability.SPAWN_WORKER,
+        ToolCapability.EXTERNAL_MCP,
+    }
+)
 
 # JSON Schema type -> Python type mapping for signature generation
 _JSON_TO_PY = {
@@ -128,18 +156,54 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
-def _resolve_mcp_mode(value: str | None = None) -> str:
+def _load_hermes_tools_config() -> dict[str, Any]:
+    """Load the profile-aware ``mcp.hermes_tools`` config block.
+
+    Config loading is best-effort because this MCP subprocess must still be
+    able to start in a fresh/minimal environment. Invalid/missing structure
+    falls back to the safe curated defaults below.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception as exc:
+        logger.warning("failed to load MCP config; using safe defaults: %s", exc)
+        return {}
+
+    mcp_cfg = config.get("mcp") or {}
+    if not isinstance(mcp_cfg, dict):
+        return {}
+    tools_cfg = mcp_cfg.get("hermes_tools") or {}
+    return tools_cfg if isinstance(tools_cfg, dict) else {}
+
+
+def _resolve_mcp_mode(
+    value: str | None = None,
+    *,
+    config: dict[str, Any] | None = None,
+) -> str:
     """Resolve and validate the MCP exposure mode.
+
+    The user-facing source is ``config.yaml``. ``HERMES_MCP_MODE`` is retained
+    as an internal/backward-compatible process override for transports that
+    need to bridge a resolved value into a subprocess.
 
     Invalid values fail closed to curated mode instead of widening the tool
     surface accidentally.
     """
-    raw = value if value is not None else os.environ.get(MCP_MODE_ENV, MCP_MODE_CURATED)
+    cfg = config if config is not None else _load_hermes_tools_config()
+    if value is not None:
+        raw = value
+    elif MCP_MODE_ENV in os.environ:
+        raw = os.environ.get(MCP_MODE_ENV)
+    else:
+        raw = cfg.get("mode", MCP_MODE_CURATED)
+
     mode = str(raw or MCP_MODE_CURATED).strip().lower()
     if mode not in _VALID_MCP_MODES:
         logger.warning(
-            "invalid %s=%r; falling back to %s",
-            MCP_MODE_ENV,
+            "invalid MCP mode=%r; falling back to %s",
             raw,
             MCP_MODE_CURATED,
         )
@@ -147,19 +211,84 @@ def _resolve_mcp_mode(value: str | None = None) -> str:
     return mode
 
 
+def _resolve_discover_external(
+    *,
+    config: dict[str, Any] | None = None,
+) -> bool:
+    cfg = config if config is not None else _load_hermes_tools_config()
+    if MCP_DISCOVER_EXTERNAL_ENV in os.environ:
+        return _env_bool(MCP_DISCOVER_EXTERNAL_ENV, True)
+    value = cfg.get("discover_external", True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    logger.warning("invalid mcp.hermes_tools.discover_external=%r; using true", value)
+    return True
+
+
+def _resolve_allow_native_execution(
+    *,
+    config: dict[str, Any] | None = None,
+) -> bool:
+    cfg = config if config is not None else _load_hermes_tools_config()
+    if MCP_ALLOW_NATIVE_EXECUTION_ENV in os.environ:
+        return _env_bool(MCP_ALLOW_NATIVE_EXECUTION_ENV, False)
+    value = cfg.get("allow_native_execution", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    logger.warning(
+        "invalid mcp.hermes_tools.allow_native_execution=%r; using false",
+        value,
+    )
+    return False
+
+
 def _resolve_exposed_tool_names(
     all_defs: dict[str, dict],
     *,
     mode: str | None = None,
+    allow_native_execution: bool = True,
+    capabilities_by_name: Mapping[str, Collection[str]] | None = None,
 ) -> tuple[str, ...]:
-    """Return tool names exposed by the selected MCP mode."""
+    """Return tool names exposed by the selected MCP capability policy.
+
+    ``all_defs`` remains the authoritative availability snapshot. In safe full
+    mode, tools carrying any security-sensitive registry capability are removed
+    regardless of their concrete name. Production startup passes a capability
+    snapshot from the same registry generation used to build ``all_defs``.
+    """
     resolved_mode = _resolve_mcp_mode(mode)
     if resolved_mode == MCP_MODE_FULL:
-        return tuple(sorted(all_defs))
+        if allow_native_execution:
+            return tuple(sorted(all_defs))
+        caps = capabilities_by_name or {}
+        return tuple(
+            sorted(
+                name
+                for name in all_defs
+                if not (_MCP_UNSAFE_CAPABILITIES & frozenset(caps.get(name, ())))
+            )
+        )
     return EXPOSED_TOOLS
 
 
-def _discover_external_mcp_tools(mode: str) -> None:
+def _discover_external_mcp_tools(
+    mode: str,
+    *,
+    enabled: bool | None = None,
+    allow_native_execution: bool = False,
+) -> None:
     """Discover configured external MCP tools before the full-mode snapshot.
 
     Discovery is intentionally synchronous here. Unlike interactive Hermes
@@ -172,8 +301,16 @@ def _discover_external_mcp_tools(mode: str) -> None:
     """
     if mode != MCP_MODE_FULL:
         return
-    if not _env_bool(MCP_DISCOVER_EXTERNAL_ENV, True):
-        logger.info("external MCP discovery disabled by %s", MCP_DISCOVER_EXTERNAL_ENV)
+    if enabled is None:
+        enabled = _resolve_discover_external()
+    if not enabled:
+        logger.info("external MCP discovery disabled by config")
+        return
+    if not allow_native_execution:
+        logger.info(
+            "external MCP discovery suppressed because "
+            "allow_native_execution is false"
+        )
         return
 
     try:
@@ -198,22 +335,32 @@ def _build_server() -> Any:
 
     from model_tools import get_tool_definitions, handle_function_call
 
-    mode = _resolve_mcp_mode()
+    mcp_config = _load_hermes_tools_config()
+    mode = _resolve_mcp_mode(config=mcp_config)
+    discover_external = _resolve_discover_external(config=mcp_config)
+    allow_native_execution = _resolve_allow_native_execution(config=mcp_config)
+
     mcp = FastMCP(
         "hermes-tools",
         instructions=(
-            "Hermes Agent tool surface exposed over MCP. In curated mode this "
-            "contains the Codex-safe Hermes-specific subset. In full mode it "
-            "contains every currently available built-in, plugin and configured "
-            "external MCP registry tool, including delegate_task, memory, "
-            "session_search and todo through the MCP agent-context bridge."
+            "Hermes Agent tool surface exposed over MCP. Curated mode contains "
+            "the Codex-safe Hermes-specific subset. Full mode contains every "
+            "currently available built-in, plugin and configured external MCP "
+            "registry tool allowed by the MCP policy. Stateful agent-loop tools "
+            "are supported through the MCP context bridge. Tools carrying native "
+            "execution, filesystem, process, UI-automation, or spawn capabilities "
+            "are included only when allow_native_execution is explicitly enabled."
         ),
     )
 
     # model_tools deliberately does not discover configured MCP servers at
     # import time. Full mode is a dedicated MCP process with a static tool list,
     # so discovery must finish before taking the authoritative registry snapshot.
-    _discover_external_mcp_tools(mode)
+    _discover_external_mcp_tools(
+        mode,
+        enabled=discover_external,
+        allow_native_execution=allow_native_execution,
+    )
 
     # Always request the raw pre-Tool-Search catalog. Otherwise progressive
     # disclosure can replace real tools with tool_search/tool_describe/tool_call
@@ -235,17 +382,27 @@ def _build_server() -> Any:
         )
     }
 
-    tool_names = _resolve_exposed_tool_names(all_defs, mode=mode)
+    capabilities_by_name = {
+        name: registry.get_tool_capabilities(name)
+        for name in all_defs
+    }
+    tool_names = _resolve_exposed_tool_names(
+        all_defs,
+        mode=mode,
+        allow_native_execution=allow_native_execution,
+        capabilities_by_name=capabilities_by_name,
+    )
 
     # Only full mode needs the stateful bridge. Curated mode keeps the exact
     # historical Codex behavior and never initializes memory/session/delegation
-    # context as a side effect.
+    # context as a side effect. The bridge receives only policy-exposed names so
+    # future context-sensitive tools cannot inherit hidden native capabilities.
     agent_context_bridge = None
     if mode == MCP_MODE_FULL:
         from agent.transports.hermes_tools_mcp_context import MCPAgentContextBridge
 
         agent_context_bridge = MCPAgentContextBridge(
-            available_tool_names=tuple(sorted(all_defs)),
+            available_tool_names=tuple(name for name in tool_names if name in all_defs),
         )
 
     exposed_count = 0
@@ -298,8 +455,9 @@ def _build_server() -> Any:
         exposed_count += 1
 
     logger.info(
-        "hermes-tools MCP server mode=%s registered %d/%d tools (%d available in registry)",
+        "hermes-tools MCP server mode=%s native_execution=%s registered %d/%d tools (%d available in registry)",
         mode,
+        allow_native_execution,
         exposed_count,
         len(tool_names),
         len(all_defs),
