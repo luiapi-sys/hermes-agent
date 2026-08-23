@@ -61,6 +61,10 @@ def test_full_mode_routes_agent_loop_tool_through_context_bridge(monkeypatch):
     monkeypatch.setattr(context_mod, "MCPAgentContextBridge", FakeBridge)
     monkeypatch.setenv("HERMES_MCP_MODE", "full")
     monkeypatch.setenv("HERMES_MCP_DISCOVER_EXTERNAL", "0")
+    # This test intentionally exercises trusted-full routing, where native
+    # Hermes execution tools are explicitly enabled. Safe full mode is covered
+    # separately by test_hermes_tools_mcp_policy.py.
+    monkeypatch.setenv("HERMES_MCP_ALLOW_NATIVE_EXECUTION", "1")
 
     server = server_mod._build_server()
 
