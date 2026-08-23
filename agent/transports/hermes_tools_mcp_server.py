@@ -24,11 +24,11 @@ User-facing behavior is configured in ``config.yaml`` under
     supported by the MCP context bridge.
 
 For security, full mode does *not* expose Hermes' native shell/file/process
-surface or ``delegate_task`` by default. Those capabilities can execute outside
-a coding client's own sandbox/approval boundary, directly or through a child
-agent. A trusted external MCP deployment (for example a dedicated ChatGPT
-remote MCP gateway) that intentionally wants the complete native surface must
-also set ``mcp.hermes_tools.allow_native_execution: true``.
+surface, ``delegate_task`` or ``cronjob`` by default. Those capabilities can
+execute outside a coding client's own sandbox/approval boundary, directly or
+through spawned agents. A trusted external MCP deployment (for example a
+dedicated ChatGPT remote MCP gateway) that intentionally wants the complete
+native surface must also set ``mcp.hermes_tools.allow_native_execution: true``.
 
 ``HERMES_MCP_MODE``, ``HERMES_MCP_DISCOVER_EXTERNAL`` and
 ``HERMES_MCP_ALLOW_NATIVE_EXECUTION`` remain supported as process-local/internal
@@ -58,8 +58,8 @@ MCP_MODE_FULL = "full"
 _VALID_MCP_MODES = {MCP_MODE_CURATED, MCP_MODE_FULL}
 
 # Native Hermes tools that can bypass a coding client's own sandbox / approval
-# layer. delegate_task is also gated because a child agent can inherit native
-# execution toolsets and would otherwise provide an indirect bypass.
+# layer. delegate_task and cronjob are also gated because they can spawn agents
+# with native execution toolsets and would otherwise provide indirect bypasses.
 _NATIVE_BOUNDARY_TOOLS: frozenset[str] = frozenset(
     {
         "terminal",
@@ -71,6 +71,7 @@ _NATIVE_BOUNDARY_TOOLS: frozenset[str] = frozenset(
         "process",
         "execute_code",
         "delegate_task",
+        "cronjob",
     }
 )
 
@@ -333,8 +334,8 @@ def _build_server() -> Any:
             "currently available built-in, plugin and configured external MCP "
             "registry tool allowed by the MCP policy. Stateful agent-loop tools "
             "are supported through the MCP context bridge. Native shell/file/process "
-            "tools and delegate_task are included only when allow_native_execution "
-            "is explicitly enabled."
+            "tools, delegate_task and cronjob are included only when "
+            "allow_native_execution is explicitly enabled."
         ),
     )
 
