@@ -85,6 +85,7 @@ def test_full_mode_protects_native_boundary_without_explicit_opt_in():
         "session_search": {},
         "todo": {},
         "delegate_task": {},
+        "cronjob": {},
         "external_mcp_tool": {},
     }
 
@@ -97,6 +98,7 @@ def test_full_mode_protects_native_boundary_without_explicit_opt_in():
     )
     assert not (exposed & _NATIVE_BOUNDARY_TOOLS)
     assert "delegate_task" not in exposed
+    assert "cronjob" not in exposed
     assert {"memory", "session_search", "todo", "external_mcp_tool"} <= exposed
 
 
@@ -112,6 +114,7 @@ def test_trusted_external_gateway_can_explicitly_enable_complete_surface():
         "session_search": {},
         "todo": {},
         "delegate_task": {},
+        "cronjob": {},
         "external_mcp_tool": {},
     }
 
