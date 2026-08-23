@@ -82,6 +82,8 @@ def test_full_mode_protects_native_boundary_without_explicit_opt_in():
         "process": {},
         "execute_code": {},
         "memory": {},
+        "session_search": {},
+        "todo": {},
         "delegate_task": {},
         "external_mcp_tool": {},
     }
@@ -94,7 +96,8 @@ def test_full_mode_protects_native_boundary_without_explicit_opt_in():
         )
     )
     assert not (exposed & _NATIVE_BOUNDARY_TOOLS)
-    assert {"memory", "delegate_task", "external_mcp_tool"} <= exposed
+    assert "delegate_task" not in exposed
+    assert {"memory", "session_search", "todo", "external_mcp_tool"} <= exposed
 
 
 def test_trusted_external_gateway_can_explicitly_enable_complete_surface():
@@ -106,6 +109,8 @@ def test_trusted_external_gateway_can_explicitly_enable_complete_surface():
         "process": {},
         "execute_code": {},
         "memory": {},
+        "session_search": {},
+        "todo": {},
         "delegate_task": {},
         "external_mcp_tool": {},
     }
