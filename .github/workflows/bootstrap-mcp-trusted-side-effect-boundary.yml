@@ -58,8 +58,8 @@ jobs:
           script = "\n".join(output) + "\n"
           assert script.startswith("python - <<'PY'\n"), repr(script[:80])
 
-          helper_old = '''    count = text.count(old)\n    assert count == 1, f"{label}: expected exactly one match, got {count}"\n    return text.replace(old, new, 1)\n'''
-          helper_new = '''    count = text.count(old)\n    if label == "get_tool_definitions signature":\n        assert count >= 1, f"{label}: expected at least one match, got {count}"\n    else:\n        assert count == 1, f"{label}: expected exactly one match, got {count}"\n    return text.replace(old, new, 1)\n'''
+          helper_old = '    count = text.count(old)\n    assert count == 1, f"{label}: expected exactly one match, got {count}"\n    return text.replace(old, new, 1)\n'
+          helper_new = '    count = text.count(old)\n    if label == "get_tool_definitions signature":\n        assert count >= 1, f"{label}: expected at least one match, got {count}"\n    else:\n        assert count == 1, f"{label}: expected exactly one match, got {count}"\n    return text.replace(old, new, 1)\n'
           assert script.count(helper_old) == 1, "replace_once helper changed"
           script = script.replace(helper_old, helper_new, 1)
 
@@ -75,32 +75,40 @@ jobs:
 
           path = Path("agent/transports/hermes_tools_mcp_server.py")
           text = path.read_text()
-          old = '''    if not allow_native_execution:
-              os.environ["HERMES_SKIP_PLUGIN_DISCOVERY"] = "1"
-
-          from model_tools import get_tool_definitions, handle_function_call
-          '''
-          new = '''    if not allow_native_execution:
-              os.environ["HERMES_SKIP_PLUGIN_DISCOVERY"] = "1"
-          else:
-              os.environ.pop("HERMES_SKIP_PLUGIN_DISCOVERY", None)
-
-          from model_tools import get_tool_definitions, handle_function_call
-
-          if allow_native_execution:
-              try:
-                  from hermes_cli.plugins import discover_plugins
-
-                  discover_plugins()
-              except Exception as exc:
-                  logger.debug("Trusted MCP plugin discovery failed: %s", exc)
-          '''
+          old = (
+              "    if not allow_native_execution:\n"
+              "        os.environ[\"HERMES_SKIP_PLUGIN_DISCOVERY\"] = \"1\"\n"
+              "\n"
+              "    from model_tools import get_tool_definitions, handle_function_call\n"
+          )
+          new = (
+              "    if not allow_native_execution:\n"
+              "        os.environ[\"HERMES_SKIP_PLUGIN_DISCOVERY\"] = \"1\"\n"
+              "    else:\n"
+              "        os.environ.pop(\"HERMES_SKIP_PLUGIN_DISCOVERY\", None)\n"
+              "\n"
+              "    from model_tools import get_tool_definitions, handle_function_call\n"
+              "\n"
+              "    if allow_native_execution:\n"
+              "        try:\n"
+              "            from hermes_cli.plugins import discover_plugins\n"
+              "\n"
+              "            discover_plugins()\n"
+              "        except Exception as exc:\n"
+              "            logger.debug(\"Trusted MCP plugin discovery failed: %s\", exc)\n"
+          )
           assert text.count(old) == 1, "plugin-discovery policy block changed"
           path.write_text(text.replace(old, new, 1))
 
           test_path = Path("tests/agent/transports/test_hermes_tools_mcp_trust_boundary.py")
           test_text = test_path.read_text()
-          test_text += '''\n\ndef test_trusted_policy_clears_safe_plugin_discovery_suppression():\n    source = Path(\"agent/transports/hermes_tools_mcp_server.py\").read_text()\n    assert 'os.environ.pop(\"HERMES_SKIP_PLUGIN_DISCOVERY\", None)' in source\n    assert \"if allow_native_execution:\\n        try:\\n            from hermes_cli.plugins import discover_plugins\" in source\n'''
+          test_text += (
+              "\n\n"
+              "def test_trusted_policy_clears_safe_plugin_discovery_suppression():\n"
+              "    source = Path(\"agent/transports/hermes_tools_mcp_server.py\").read_text()\n"
+              "    assert 'os.environ.pop(\"HERMES_SKIP_PLUGIN_DISCOVERY\", None)' in source\n"
+              "    assert \"if allow_native_execution:\\n        try:\\n            from hermes_cli.plugins import discover_plugins\" in source\n"
+          )
           if "from pathlib import Path\n" not in test_text:
               future = "from __future__ import annotations\n"
               assert test_text.startswith(future), "unexpected test module preamble"
