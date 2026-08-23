@@ -256,9 +256,14 @@ def _resolve_exposed_tool_names(
     all_defs: dict[str, dict],
     *,
     mode: str | None = None,
-    allow_native_execution: bool = False,
+    allow_native_execution: bool = True,
 ) -> tuple[str, ...]:
-    """Return tool names exposed by the selected MCP policy."""
+    """Return tool names exposed by the selected MCP policy.
+
+    The internal helper preserves its historical direct-call behavior by
+    defaulting ``allow_native_execution`` to true. Production startup always
+    passes the explicitly resolved policy value from config.
+    """
     resolved_mode = _resolve_mcp_mode(mode)
     if resolved_mode == MCP_MODE_FULL:
         names = set(all_defs)
@@ -268,7 +273,11 @@ def _resolve_exposed_tool_names(
     return EXPOSED_TOOLS
 
 
-def _discover_external_mcp_tools(mode: str, *, enabled: bool) -> None:
+def _discover_external_mcp_tools(
+    mode: str,
+    *,
+    enabled: bool | None = None,
+) -> None:
     """Discover configured external MCP tools before the full-mode snapshot.
 
     Discovery is intentionally synchronous here. Unlike interactive Hermes
@@ -281,6 +290,8 @@ def _discover_external_mcp_tools(mode: str, *, enabled: bool) -> None:
     """
     if mode != MCP_MODE_FULL:
         return
+    if enabled is None:
+        enabled = _resolve_discover_external()
     if not enabled:
         logger.info("external MCP discovery disabled by config")
         return
