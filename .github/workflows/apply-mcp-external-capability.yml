@@ -1,0 +1,146 @@
+name: Apply External MCP Capability
+
+on:
+  pull_request:
+    branches:
+      - fix/mcp-full-policy-hardening
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.head_ref == 'fix/mcp-external-capability'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/mcp-external-capability
+          fetch-depth: 0
+
+      - name: Apply external MCP capability classification
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}: {old[:100]!r}")
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace_once(
+              "tools/registry.py",
+              '    SPAWN_WORKER = "spawn_worker"\n',
+              '    SPAWN_WORKER = "spawn_worker"\n    EXTERNAL_MCP = "external_mcp"\n',
+          )
+
+          replace_once(
+              "agent/transports/hermes_tools_mcp_server.py",
+              '''        ToolCapability.SPAWN_WORKER,\n    }\n)''',
+              '''        ToolCapability.SPAWN_WORKER,\n        ToolCapability.EXTERNAL_MCP,\n    }\n)''',
+          )
+          replace_once(
+              "agent/transports/hermes_tools_mcp_server.py",
+              '''filesystem, process-control, UI-automation, agent-spawn, or worker-spawn\ncapabilities by default.''',
+              '''filesystem, process-control, UI-automation, agent-spawn, worker-spawn, or\nexternal-MCP capabilities by default.''',
+          )
+
+          replace_once(
+              "tools/mcp_tool.py",
+              '    from tools.registry import registry\n\n    registered_names: List[str] = []',
+              '    from tools.registry import ToolCapability, registry\n\n    registered_names: List[str] = []',
+          )
+          # There are exactly two registry.register() calls inside _register_server_tools:
+          # discovered MCP tools and resource/prompt utility RPCs. Classify both as
+          # opaque external effects so safe-full fails closed.
+          p = Path("tools/mcp_tool.py")
+          text = p.read_text(encoding="utf-8")
+          start = text.index("def _register_server_tools(")
+          end = text.index("\n\nasync def _discover_and_register_server", start)
+          block = text[start:end]
+          marker = '            description=schema["description"],\n        )'
+          count = block.count(marker)
+          if count != 2:
+              raise SystemExit(f"tools/mcp_tool.py: expected 2 external register markers, found {count}")
+          block = block.replace(
+              marker,
+              '            description=schema["description"],\n            capabilities={ToolCapability.EXTERNAL_MCP},\n        )',
+          )
+          p.write_text(text[:start] + block + text[end:], encoding="utf-8")
+
+          replace_once(
+              "tests/agent/transports/test_hermes_tools_mcp_policy.py",
+              '''        "external_mcp_tool": set(),\n    }''',
+              '''        "external_mcp_tool": {ToolCapability.EXTERNAL_MCP},\n    }''',
+          )
+          replace_once(
+              "tests/agent/transports/test_hermes_tools_mcp_policy.py",
+              '''    assert "future_worker_tool" not in exposed\n    assert {"memory", "external_mcp_tool"} <= exposed''',
+              '''    assert "future_worker_tool" not in exposed\n    assert "external_mcp_tool" not in exposed\n    assert "memory" in exposed''',
+          )
+          replace_once(
+              "tests/agent/transports/test_hermes_tools_mcp_policy.py",
+              '''        ToolCapability.SPAWN_WORKER,\n    } <= _MCP_UNSAFE_CAPABILITIES''',
+              '''        ToolCapability.SPAWN_WORKER,\n        ToolCapability.EXTERNAL_MCP,\n    } <= _MCP_UNSAFE_CAPABILITIES''',
+          )
+
+          # Strengthen existing MCP registration test with the actual registry metadata.
+          replace_once(
+              "tests/tools/test_mcp_tool.py",
+              '''        assert "mcp__fs__read_file" in mock_registry.get_all_tool_names()\n        assert "mcp__fs__write_file" in mock_registry.get_all_tool_names()\n\n        _servers.pop("fs", None)''',
+              '''        assert "mcp__fs__read_file" in mock_registry.get_all_tool_names()\n        assert "mcp__fs__write_file" in mock_registry.get_all_tool_names()\n        from tools.registry import ToolCapability\n        assert ToolCapability.EXTERNAL_MCP in mock_registry.get_tool_capabilities("mcp__fs__read_file")\n        assert ToolCapability.EXTERNAL_MCP in mock_registry.get_tool_capabilities("mcp__fs__write_file")\n\n        _servers.pop("fs", None)''',
+          )
+          PY
+
+      - name: Remove one-shot workflow from resulting commit
+        run: git rm .github/workflows/apply-mcp-external-capability.yml
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Targeted MCP tests
+        run: |
+          uv run pytest -q \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/agent/transports/test_hermes_tools_mcp_server.py \
+            tests/agent/transports/test_hermes_tools_mcp_agent_loop_routing.py \
+            tests/agent/transports/test_hermes_tools_mcp_context.py \
+            tests/tools/test_mcp_tool.py
+
+      - name: Ruff changed files
+        run: |
+          uv run ruff check \
+            tools/registry.py \
+            tools/mcp_tool.py \
+            agent/transports/hermes_tools_mcp_server.py \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/tools/test_mcp_tool.py
+
+      - name: Commit validated hardening
+        run: |
+          set -euo pipefail
+          git config user.name "Apichart Hanmuangjai"
+          git config user.email "luiapi.sys@gmail.com"
+          git add tools/registry.py tools/mcp_tool.py agent/transports/hermes_tools_mcp_server.py tests/agent/transports/test_hermes_tools_mcp_policy.py tests/tools/test_mcp_tool.py
+          git diff --cached --check
+          git commit -m "fix(mcp): classify external MCP calls as unsafe capability"
+          git push origin HEAD:fix/mcp-external-capability
