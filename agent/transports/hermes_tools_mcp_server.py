@@ -71,6 +71,7 @@ _MCP_UNSAFE_CAPABILITIES: frozenset[str] = frozenset(
         ToolCapability.SPAWN_AGENT,
         ToolCapability.SPAWN_WORKER,
         ToolCapability.EXTERNAL_MCP,
+        ToolCapability.EXTERNAL_SIDE_EFFECT,
     }
 )
 
@@ -269,18 +270,26 @@ def _resolve_exposed_tool_names(
     snapshot from the same registry generation used to build ``all_defs``.
     """
     resolved_mode = _resolve_mcp_mode(mode)
+    caps = capabilities_by_name or {}
     if resolved_mode == MCP_MODE_FULL:
         if allow_native_execution:
             return tuple(sorted(all_defs))
-        caps = capabilities_by_name or {}
         return tuple(
             sorted(
                 name
                 for name in all_defs
-                if not (_MCP_UNSAFE_CAPABILITIES & frozenset(caps.get(name, ())))
+                if ToolCapability.MCP_SAFE in frozenset(caps.get(name, ()))
+                and not (_MCP_UNSAFE_CAPABILITIES & frozenset(caps.get(name, ())))
             )
         )
-    return EXPOSED_TOOLS
+    if allow_native_execution:
+        return EXPOSED_TOOLS
+    return tuple(
+        name
+        for name in EXPOSED_TOOLS
+        if name in all_defs
+        and not (_MCP_UNSAFE_CAPABILITIES & frozenset(caps.get(name, ())))
+    )
 
 
 def _discover_external_mcp_tools(
@@ -333,12 +342,20 @@ def _build_server() -> Any:
             f"hermes-tools MCP server requires the 'mcp' package: {exc}"
         ) from exc
 
-    from model_tools import get_tool_definitions, handle_function_call
-
     mcp_config = _load_hermes_tools_config()
     mode = _resolve_mcp_mode(config=mcp_config)
     discover_external = _resolve_discover_external(config=mcp_config)
     allow_native_execution = _resolve_allow_native_execution(config=mcp_config)
+
+    # Importing user/project/pip plugins executes arbitrary Python. Safe MCP
+    # modes suppress plugin discovery before model_tools is imported; trusted
+    # native mode intentionally retains the complete available plugin surface.
+    if allow_native_execution:
+        os.environ.pop("HERMES_SKIP_PLUGIN_DISCOVERY", None)
+    else:
+        os.environ["HERMES_SKIP_PLUGIN_DISCOVERY"] = "1"
+
+    from model_tools import get_tool_definitions, handle_function_call
 
     mcp = FastMCP(
         "hermes-tools",
@@ -369,8 +386,23 @@ def _build_server() -> Any:
         td["function"]["name"]: td["function"]
         for td in (
             get_tool_definitions(
-                quiet_mode=True,
-                skip_tool_search_assembly=True,
+                **(
+                    {
+                        "quiet_mode": True,
+                        "skip_tool_search_assembly": True,
+                    }
+                    if allow_native_execution
+                    else {
+                        "quiet_mode": True,
+                        "skip_tool_search_assembly": True,
+                        "exclude_capabilities": set(_MCP_UNSAFE_CAPABILITIES),
+                        **(
+                            {"require_capabilities": {ToolCapability.MCP_SAFE}}
+                            if mode == MCP_MODE_FULL
+                            else {}
+                        ),
+                    }
+                )
             )
             or []
         )

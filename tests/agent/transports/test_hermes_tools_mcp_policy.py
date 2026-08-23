@@ -126,7 +126,7 @@ def test_safe_full_filters_by_capability_not_concrete_tool_name():
     caps = {
         "future_ui_tool": {ToolCapability.UI_AUTOMATION},
         "future_worker_tool": {ToolCapability.SPAWN_WORKER},
-        "memory": set(),
+        "memory": {ToolCapability.MCP_SAFE},
         "external_mcp_tool": {ToolCapability.EXTERNAL_MCP},
     }
     exposed = set(
@@ -194,3 +194,47 @@ def test_registered_escape_surfaces_are_classified():
     }
     for name, capability in expected.items():
         assert capability in registry.get_tool_capabilities(name), name
+
+
+
+def test_safe_full_is_explicit_allow_and_fail_closed_for_unclassified_tools():
+    from agent.transports.hermes_tools_mcp_server import _resolve_exposed_tool_names
+    from tools.registry import ToolCapability
+
+    all_defs = {
+        "reviewed_safe": {"name": "reviewed_safe"},
+        "new_unclassified_tool": {"name": "new_unclassified_tool"},
+        "unsafe": {"name": "unsafe"},
+    }
+    caps = {
+        "reviewed_safe": {ToolCapability.MCP_SAFE},
+        "new_unclassified_tool": set(),
+        "unsafe": {ToolCapability.MCP_SAFE, ToolCapability.HOST_EXECUTION},
+    }
+    exposed = _resolve_exposed_tool_names(
+        all_defs,
+        mode="full",
+        allow_native_execution=False,
+        capabilities_by_name=caps,
+    )
+    assert exposed == ("reviewed_safe",)
+
+
+def test_registry_capability_filter_runs_before_availability_probe():
+    from tools.registry import ToolCapability, ToolRegistry
+
+    calls = []
+    reg = ToolRegistry()
+    reg.register(
+        name="unsafe_probe",
+        toolset="custom",
+        schema={"name": "unsafe_probe", "parameters": {"type": "object"}},
+        handler=lambda args, **kwargs: "ok",
+        check_fn=lambda: calls.append("probe") or True,
+        capabilities={ToolCapability.HOST_EXECUTION},
+    )
+    assert reg.get_definitions(
+        {"unsafe_probe"},
+        exclude_capabilities={ToolCapability.HOST_EXECUTION},
+    ) == []
+    assert calls == []

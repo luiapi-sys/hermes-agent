@@ -42,6 +42,8 @@ class ToolCapability:
     SPAWN_AGENT = "spawn_agent"
     SPAWN_WORKER = "spawn_worker"
     EXTERNAL_MCP = "external_mcp"
+    EXTERNAL_SIDE_EFFECT = "external_side_effect"
+    MCP_SAFE = "mcp_safe"
 
 
 _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
@@ -55,6 +57,61 @@ _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
     ),
     "delegation": frozenset({ToolCapability.SPAWN_AGENT}),
     "cronjob": frozenset({ToolCapability.SPAWN_AGENT}),
+    "browser": frozenset(
+        {
+            ToolCapability.UI_AUTOMATION,
+            ToolCapability.PROCESS_CONTROL,
+            ToolCapability.HOST_EXECUTION,
+        }
+    ),
+    "browser-cdp": frozenset(
+        {
+            ToolCapability.UI_AUTOMATION,
+            ToolCapability.FILESYSTEM_ACCESS,
+            ToolCapability.HOST_EXECUTION,
+        }
+    ),
+    "vision": frozenset(
+        {ToolCapability.FILESYSTEM_ACCESS, ToolCapability.PROCESS_CONTROL}
+    ),
+    "video": frozenset(
+        {ToolCapability.FILESYSTEM_ACCESS, ToolCapability.PROCESS_CONTROL}
+    ),
+    "image_gen": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "video_gen": frozenset(
+        {ToolCapability.HOST_EXECUTION, ToolCapability.EXTERNAL_SIDE_EFFECT}
+    ),
+    "tts": frozenset(
+        {
+            ToolCapability.FILESYSTEM_ACCESS,
+            ToolCapability.HOST_EXECUTION,
+            ToolCapability.PROCESS_CONTROL,
+        }
+    ),
+}
+
+# Safe-full is intentionally fail-closed. Only names carrying MCP_SAFE are
+# eligible when allow_native_execution=false. New tools therefore stay hidden
+# until their behavior has been reviewed explicitly.
+_TOOL_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
+    "memory": frozenset({ToolCapability.MCP_SAFE}),
+    "session_search": frozenset({ToolCapability.MCP_SAFE}),
+    "todo": frozenset({ToolCapability.MCP_SAFE}),
+    "web_search": frozenset({ToolCapability.MCP_SAFE}),
+    "web_extract": frozenset({ToolCapability.MCP_SAFE}),
+    "skills_list": frozenset({ToolCapability.MCP_SAFE}),
+    "skill_view": frozenset({ToolCapability.MCP_SAFE}),
+    "skill_manage": frozenset(
+        {
+            ToolCapability.FILESYSTEM_ACCESS,
+            ToolCapability.HOST_EXECUTION,
+            ToolCapability.PROCESS_CONTROL,
+        }
+    ),
+    "kanban_create": frozenset({ToolCapability.SPAWN_WORKER}),
+    "kanban_unblock": frozenset({ToolCapability.SPAWN_WORKER}),
+    "kanban_complete": frozenset({ToolCapability.SPAWN_WORKER}),
+    "kanban_block": frozenset({ToolCapability.SPAWN_WORKER}),
 }
 
 
@@ -424,9 +481,11 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
-        resolved_capabilities = frozenset(
-            _TOOLSET_DEFAULT_CAPABILITIES.get(toolset, frozenset())
-        ).union(capabilities or ())
+        resolved_capabilities = (
+            frozenset(_TOOLSET_DEFAULT_CAPABILITIES.get(toolset, frozenset()))
+            .union(_TOOL_DEFAULT_CAPABILITIES.get(name, frozenset()))
+            .union(capabilities or ())
+        )
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -570,7 +629,13 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
+    def get_definitions(
+        self,
+        tool_names: Set[str],
+        quiet: bool = False,
+        exclude_capabilities: Optional[Set[str]] = None,
+        require_capabilities: Optional[Set[str]] = None,
+    ) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
         Only tools whose ``check_fn()`` returns True (or have no check_fn)
@@ -590,6 +655,18 @@ class ToolRegistry:
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:
+                continue
+            # Filter security policy BEFORE availability checks. Some check_fn
+            # implementations start Docker/browser processes or discover plugins;
+            # a hidden unsafe tool must not execute code merely to decide whether
+            # it would have been available.
+            if exclude_capabilities and entry.capabilities.intersection(
+                exclude_capabilities
+            ):
+                continue
+            if require_capabilities and not frozenset(require_capabilities).issubset(
+                entry.capabilities
+            ):
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
