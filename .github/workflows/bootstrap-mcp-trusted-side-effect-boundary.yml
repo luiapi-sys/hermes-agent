@@ -34,11 +34,32 @@ jobs:
           end = text.index(end_marker, start)
           block = text[start:end]
           yaml_indent = "          "
-          lines = block.splitlines()
-          script = "\n".join(
-              line[len(yaml_indent):] if line.startswith(yaml_indent) else line
-              for line in lines
-          ) + "\n"
+          triple = None
+          output = []
+          for raw in block.splitlines():
+              candidate = raw[len(yaml_indent):] if raw.startswith(yaml_indent) else raw
+              if triple is None:
+                  line = candidate
+                  positions = [
+                      (line.find(marker), marker)
+                      for marker in ("'''", '\"\"\"')
+                      if line.find(marker) >= 0 and line.count(marker) % 2 == 1
+                  ]
+                  if positions:
+                      _, triple = min(positions)
+              else:
+                  # Interior lines are literal string content and may
+                  # intentionally start with 10+ spaces. Preserve them verbatim.
+                  # A line containing the matching delimiter is Python source
+                  # again, so remove the YAML indentation from that line only.
+                  if triple in raw and raw.count(triple) % 2 == 1:
+                      line = candidate
+                      triple = None
+                  else:
+                      line = raw
+              output.append(line)
+          assert triple is None, "unterminated triple-quoted literal in extracted script"
+          script = "\n".join(output) + "\n"
           assert script.startswith("python - <<'PY'\n"), repr(script[:80])
           Path("/tmp/apply-capability-hardening.sh").write_text(script)
           PY
@@ -82,7 +103,13 @@ jobs:
           test_text = test_path.read_text()
           test_text += '''\n\ndef test_trusted_policy_clears_safe_plugin_discovery_suppression():\n    source = Path(\"agent/transports/hermes_tools_mcp_server.py\").read_text()\n    assert 'os.environ.pop(\"HERMES_SKIP_PLUGIN_DISCOVERY\", None)' in source\n    assert \"if allow_native_execution:\\n        try:\\n            from hermes_cli.plugins import discover_plugins\" in source\n'''
           if "from pathlib import Path\n" not in test_text:
-              test_text = "from pathlib import Path\n" + test_text
+              future = "from __future__ import annotations\n"
+              assert test_text.startswith(future), "unexpected test module preamble"
+              test_text = test_text.replace(
+                  future,
+                  future + "\nfrom pathlib import Path\n",
+                  1,
+              )
           test_path.write_text(test_text)
           PY
 
