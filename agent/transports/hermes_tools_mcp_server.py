@@ -15,12 +15,9 @@ This module supports two exposure modes controlled by ``HERMES_MCP_MODE``:
     Expose every Hermes tool definition that is currently available from the
     registry. The raw pre-Tool-Search catalog is used so progressive disclosure
     cannot hide tools from the MCP server. Availability checks still apply.
-
-Important: ``delegate_task``, ``memory``, ``session_search`` and ``todo`` may
-appear in full mode, but ``model_tools.handle_function_call()`` still rejects
-those agent-loop tools without a running ``AIAgent`` context. Full exposure is
-therefore complete at the schema/catalog layer, while those four tools still
-need a dedicated agent-context bridge for successful execution.
+    The four agent-loop tools (``delegate_task``, ``memory``, ``session_search``
+    and ``todo``) are routed through a dedicated MCP context bridge so their
+    normal registered handlers receive the state they require.
 
 Run with: python -m agent.transports.hermes_tools_mcp_server
 Spawned by: CodexAppServerSession.ensure_started() when the runtime is active
@@ -81,7 +78,7 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 
 # Historical Codex-oriented allowlist. Keep this stable for curated mode so
 # existing codex_app_server users do not suddenly receive duplicate shell/file
-# tools or agent-loop tools that cannot be dispatched statelessly.
+# tools or agent-loop tools.
 EXPOSED_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_extract",
@@ -160,9 +157,9 @@ def _build_server() -> Any:
         instructions=(
             "Hermes Agent tool surface exposed over MCP. In curated mode this "
             "contains the Codex-safe Hermes-specific subset. In full mode it "
-            "contains every currently available registry tool. Agent-loop "
-            "tools such as delegate_task, memory, session_search and todo may "
-            "require additional AIAgent context even when listed."
+            "contains every currently available registry tool, including "
+            "delegate_task, memory, session_search and todo through the MCP "
+            "agent-context bridge."
         ),
     )
 
@@ -187,6 +184,18 @@ def _build_server() -> Any:
     }
 
     tool_names = _resolve_exposed_tool_names(all_defs, mode=mode)
+
+    # Only full mode needs the stateful bridge. Curated mode keeps the exact
+    # historical Codex behavior and never initializes memory/session/delegation
+    # context as a side effect.
+    agent_context_bridge = None
+    if mode == MCP_MODE_FULL:
+        from agent.transports.hermes_tools_mcp_context import MCPAgentContextBridge
+
+        agent_context_bridge = MCPAgentContextBridge(
+            available_tool_names=tuple(sorted(all_defs)),
+        )
+
     exposed_count = 0
 
     for name in tool_names:
@@ -211,6 +220,11 @@ def _build_server() -> Any:
                     # as Python None are treated as omitted. A future schema-
                     # fidelity change can preserve explicit JSON null separately.
                     args = {k: v for k, v in kwargs.items() if v is not None}
+                    if (
+                        agent_context_bridge is not None
+                        and agent_context_bridge.supports(tool_name)
+                    ):
+                        return agent_context_bridge.dispatch(tool_name, args or {})
                     return handle_function_call(tool_name, args or {})
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
