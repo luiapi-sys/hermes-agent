@@ -1,0 +1,389 @@
+name: Apply MCP Capability Boundary
+
+on:
+  pull_request:
+    branches:
+      - fix/mcp-full-policy-hardening
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.head_ref == 'fix/mcp-capability-boundary'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/mcp-capability-boundary
+          fetch-depth: 0
+
+      - name: Apply capability metadata refactor
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}: {old[:120]!r}")
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          registry_path = "tools/registry.py"
+          replace_once(
+              registry_path,
+              "logger = logging.getLogger(__name__)\n\n\ndef _is_registry_register_call",
+              '''logger = logging.getLogger(__name__)\n\n\nclass ToolCapability:\n    """Security-relevant capabilities carried by registered tools.\n\n    These are intentionally coarse. Transports can deny capability classes\n    without knowing concrete tool names, so future tools inherit the correct\n    boundary from their toolset or explicit registration metadata.\n    """\n\n    HOST_EXECUTION = "host_execution"\n    FILESYSTEM_ACCESS = "filesystem_access"\n    PROCESS_CONTROL = "process_control"\n    UI_AUTOMATION = "ui_automation"\n    SPAWN_AGENT = "spawn_agent"\n    SPAWN_WORKER = "spawn_worker"\n\n\n_TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {\n    "terminal": frozenset(\n        {ToolCapability.HOST_EXECUTION, ToolCapability.PROCESS_CONTROL}\n    ),\n    "file": frozenset({ToolCapability.FILESYSTEM_ACCESS}),\n    "code_execution": frozenset({ToolCapability.HOST_EXECUTION}),\n    "computer_use": frozenset(\n        {ToolCapability.UI_AUTOMATION, ToolCapability.HOST_EXECUTION}\n    ),\n    "delegation": frozenset({ToolCapability.SPAWN_AGENT}),\n    "cronjob": frozenset({ToolCapability.SPAWN_AGENT}),\n}\n\n\ndef _is_registry_register_call''',
+          )
+          replace_once(
+              registry_path,
+              '''        "max_result_size_chars", "dynamic_schema_overrides",\n    )''',
+              '''        "max_result_size_chars", "dynamic_schema_overrides", "capabilities",\n    )''',
+          )
+          replace_once(
+              registry_path,
+              '''    def __init__(self, name, toolset, schema, handler, check_fn,\n                 requires_env, is_async, description, emoji,\n                 max_result_size_chars=None, dynamic_schema_overrides=None):''',
+              '''    def __init__(self, name, toolset, schema, handler, check_fn,\n                 requires_env, is_async, description, emoji,\n                 max_result_size_chars=None, dynamic_schema_overrides=None,\n                 capabilities=None):''',
+          )
+          replace_once(
+              registry_path,
+              '''        self.emoji = emoji\n        self.max_result_size_chars = max_result_size_chars''',
+              '''        self.emoji = emoji\n        self.capabilities = frozenset(capabilities or ())\n        self.max_result_size_chars = max_result_size_chars''',
+          )
+          replace_once(
+              registry_path,
+              '''    def get_entry(self, name: str) -> Optional[ToolEntry]:\n        """Return a registered tool entry by name, or None."""\n        with self._lock:\n            return self._tools.get(name)\n\n    def get_registered_toolset_names''',
+              '''    def get_entry(self, name: str) -> Optional[ToolEntry]:\n        """Return a registered tool entry by name, or None."""\n        with self._lock:\n            return self._tools.get(name)\n\n    def get_tool_capabilities(self, name: str) -> frozenset[str]:\n        """Return immutable security capabilities for a registered tool."""\n        entry = self.get_entry(name)\n        return entry.capabilities if entry is not None else frozenset()\n\n    def get_registered_toolset_names''',
+          )
+          replace_once(
+              registry_path,
+              '''        max_result_size_chars: int | float | None = None,\n        dynamic_schema_overrides: Callable = None,\n        override: bool = False,''',
+              '''        max_result_size_chars: int | float | None = None,\n        dynamic_schema_overrides: Callable = None,\n        capabilities: Set[str] = None,\n        override: bool = False,''',
+          )
+          replace_once(
+              registry_path,
+              '''        with self._lock:\n            existing = self._tools.get(name)''',
+              '''        resolved_capabilities = frozenset(\n            _TOOLSET_DEFAULT_CAPABILITIES.get(toolset, frozenset())\n        ).union(capabilities or ())\n        with self._lock:\n            existing = self._tools.get(name)''',
+          )
+          replace_once(
+              registry_path,
+              '''                emoji=emoji,\n                max_result_size_chars=max_result_size_chars,''',
+              '''                emoji=emoji,\n                capabilities=resolved_capabilities,\n                max_result_size_chars=max_result_size_chars,''',
+          )
+
+          server_path = "agent/transports/hermes_tools_mcp_server.py"
+          replace_once(
+              server_path,
+              '''from typing import Any, Optional\n\nlogger = logging.getLogger(__name__)''',
+              '''from typing import Any, Collection, Mapping, Optional\n\nfrom tools.registry import ToolCapability, registry\n\nlogger = logging.getLogger(__name__)''',
+          )
+          replace_once(
+              server_path,
+              '''# Native Hermes tools that can bypass a coding client's own sandbox / approval\n# layer. delegate_task and cronjob are also gated because they can spawn agents\n# with native execution toolsets and would otherwise provide indirect bypasses.\n_NATIVE_BOUNDARY_TOOLS: frozenset[str] = frozenset(\n    {\n        "terminal",\n        "shell",\n        "read_file",\n        "write_file",\n        "patch",\n        "search_files",\n        "process",\n        "execute_code",\n        "delegate_task",\n        "cronjob",\n    }\n)''',
+              '''# Security capabilities that can escape a coding client's own sandbox or\n# approval boundary. The registry, not this transport, owns tool classification.\n_MCP_UNSAFE_CAPABILITIES: frozenset[str] = frozenset(\n    {\n        ToolCapability.HOST_EXECUTION,\n        ToolCapability.FILESYSTEM_ACCESS,\n        ToolCapability.PROCESS_CONTROL,\n        ToolCapability.UI_AUTOMATION,\n        ToolCapability.SPAWN_AGENT,\n        ToolCapability.SPAWN_WORKER,\n    }\n)''',
+          )
+          replace_once(
+              server_path,
+              '''For security, full mode does *not* expose Hermes' native shell/file/process\nsurface, ``delegate_task`` or ``cronjob`` by default. Those capabilities can\nexecute outside a coding client's own sandbox/approval boundary, directly or\nthrough spawned agents. A trusted external MCP deployment (for example a\ndedicated ChatGPT remote MCP gateway) that intentionally wants the complete\nnative surface must also set ``mcp.hermes_tools.allow_native_execution: true``.''',
+              '''For security, full mode filters registry tools carrying host-execution,\nfilesystem, process-control, UI-automation, agent-spawn, or worker-spawn\ncapabilities by default. Classification lives in the central tool registry so\nfuture tools inherit the boundary from their toolset or explicit metadata. A\ntrusted external MCP deployment (for example a dedicated ChatGPT remote MCP\ngateway) that intentionally wants the complete native surface must also set\n``mcp.hermes_tools.allow_native_execution: true``.''',
+          )
+          old_resolver = '''def _resolve_exposed_tool_names(\n    all_defs: dict[str, dict],\n    *,\n    mode: str | None = None,\n    allow_native_execution: bool = True,\n) -> tuple[str, ...]:\n    """Return tool names exposed by the selected MCP policy.\n\n    The internal helper preserves its historical direct-call behavior by\n    defaulting ``allow_native_execution`` to true. Production startup always\n    passes the explicitly resolved policy value from config.\n    """\n    resolved_mode = _resolve_mcp_mode(mode)\n    if resolved_mode == MCP_MODE_FULL:\n        names = set(all_defs)\n        if not allow_native_execution:\n            names.difference_update(_NATIVE_BOUNDARY_TOOLS)\n        return tuple(sorted(names))\n    return EXPOSED_TOOLS\n'''
+          new_resolver = '''def _resolve_exposed_tool_names(\n    all_defs: dict[str, dict],\n    *,\n    mode: str | None = None,\n    allow_native_execution: bool = True,\n    capabilities_by_name: Mapping[str, Collection[str]] | None = None,\n) -> tuple[str, ...]:\n    """Return tool names exposed by the selected MCP capability policy.\n\n    ``all_defs`` remains the authoritative availability snapshot. In safe full\n    mode, tools carrying any security-sensitive registry capability are removed\n    regardless of their concrete name. Production startup passes a capability\n    snapshot from the same registry generation used to build ``all_defs``.\n    """\n    resolved_mode = _resolve_mcp_mode(mode)\n    if resolved_mode == MCP_MODE_FULL:\n        if allow_native_execution:\n            return tuple(sorted(all_defs))\n        caps = capabilities_by_name or {}\n        return tuple(\n            sorted(\n                name\n                for name in all_defs\n                if not (_MCP_UNSAFE_CAPABILITIES & frozenset(caps.get(name, ())))\n            )\n        )\n    return EXPOSED_TOOLS\n'''
+          replace_once(server_path, old_resolver, new_resolver)
+          replace_once(
+              server_path,
+              '''            "are supported through the MCP context bridge. Native shell/file/process "\n            "tools, delegate_task and cronjob are included only when "\n            "allow_native_execution is explicitly enabled."''',
+              '''            "are supported through the MCP context bridge. Tools carrying native "\n            "execution, filesystem, process, UI-automation, or spawn capabilities "\n            "are included only when allow_native_execution is explicitly enabled."''',
+          )
+          replace_once(
+              server_path,
+              '''    tool_names = _resolve_exposed_tool_names(\n        all_defs,\n        mode=mode,\n        allow_native_execution=allow_native_execution,\n    )''',
+              '''    capabilities_by_name = {\n        name: registry.get_tool_capabilities(name)\n        for name in all_defs\n    }\n    tool_names = _resolve_exposed_tool_names(\n        all_defs,\n        mode=mode,\n        allow_native_execution=allow_native_execution,\n        capabilities_by_name=capabilities_by_name,\n    )''',
+          )
+
+          kanban_path = "tools/kanban_tools.py"
+          replace_once(
+              kanban_path,
+              "from tools.registry import registry, tool_error",
+              "from tools.registry import ToolCapability, registry, tool_error",
+          )
+          for tool_name, emoji in (
+              ("kanban_create", "➕"),
+              ("kanban_unblock", "▶"),
+              ("kanban_complete", "✔"),
+          ):
+              old = f'''registry.register(\n    name="{tool_name}",\n    toolset="kanban",'''
+              new = f'''registry.register(\n    name="{tool_name}",\n    toolset="kanban",'''
+              # Add capability immediately before emoji to avoid depending on schema/handler lines.
+              text = Path(kanban_path).read_text(encoding="utf-8")
+              start = text.find(old)
+              if start < 0:
+                  raise SystemExit(f"{kanban_path}: registration not found for {tool_name}")
+              end = text.find("\n)\n", start)
+              if end < 0:
+                  raise SystemExit(f"{kanban_path}: registration end not found for {tool_name}")
+              block = text[start:end]
+              marker = f'    emoji="{emoji}",'
+              if block.count(marker) != 1:
+                  raise SystemExit(f"{kanban_path}: emoji marker mismatch for {tool_name}")
+              block_new = block.replace(
+                  marker,
+                  f'    capabilities={{ToolCapability.SPAWN_WORKER}},\n{marker}',
+                  1,
+              )
+              Path(kanban_path).write_text(
+                  text[:start] + block_new + text[end:],
+                  encoding="utf-8",
+              )
+          PY
+
+          cat > tests/agent/transports/test_hermes_tools_mcp_policy.py <<'PY'
+          """Policy tests for Hermes full-surface MCP exposure."""
+
+          from __future__ import annotations
+
+          from agent.transports.hermes_tools_mcp_server import (
+              MCP_ALLOW_NATIVE_EXECUTION_ENV,
+              MCP_DISCOVER_EXTERNAL_ENV,
+              MCP_MODE_CURATED,
+              MCP_MODE_FULL,
+              _MCP_UNSAFE_CAPABILITIES,
+              _load_hermes_tools_config,
+              _resolve_allow_native_execution,
+              _resolve_discover_external,
+              _resolve_exposed_tool_names,
+              _resolve_mcp_mode,
+          )
+          from tools.registry import ToolCapability, ToolRegistry
+
+
+          def _schema(name: str) -> dict:
+              return {
+                  "name": name,
+                  "description": name,
+                  "parameters": {"type": "object", "properties": {}},
+              }
+
+
+          def test_profile_config_is_primary_user_facing_source(monkeypatch):
+              import hermes_cli.config as config_module
+
+              monkeypatch.delenv("HERMES_MCP_MODE", raising=False)
+              monkeypatch.delenv(MCP_DISCOVER_EXTERNAL_ENV, raising=False)
+              monkeypatch.delenv(MCP_ALLOW_NATIVE_EXECUTION_ENV, raising=False)
+              monkeypatch.setattr(
+                  config_module,
+                  "load_config",
+                  lambda: {
+                      "mcp": {
+                          "hermes_tools": {
+                              "mode": "full",
+                              "discover_external": False,
+                              "allow_native_execution": True,
+                          }
+                      }
+                  },
+              )
+
+              cfg = _load_hermes_tools_config()
+              assert cfg == {
+                  "mode": "full",
+                  "discover_external": False,
+                  "allow_native_execution": True,
+              }
+              assert _resolve_mcp_mode(config=cfg) == MCP_MODE_FULL
+              assert _resolve_discover_external(config=cfg) is False
+              assert _resolve_allow_native_execution(config=cfg) is True
+
+
+          def test_missing_config_fails_closed(monkeypatch):
+              monkeypatch.delenv("HERMES_MCP_MODE", raising=False)
+              monkeypatch.delenv(MCP_DISCOVER_EXTERNAL_ENV, raising=False)
+              monkeypatch.delenv(MCP_ALLOW_NATIVE_EXECUTION_ENV, raising=False)
+
+              assert _resolve_mcp_mode(config={}) == MCP_MODE_CURATED
+              assert _resolve_discover_external(config={}) is True
+              assert _resolve_allow_native_execution(config={}) is False
+
+
+          def test_legacy_process_override_remains_supported(monkeypatch):
+              monkeypatch.setenv("HERMES_MCP_MODE", "full")
+              monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "0")
+              monkeypatch.setenv(MCP_ALLOW_NATIVE_EXECUTION_ENV, "1")
+
+              cfg = {
+                  "mode": "curated",
+                  "discover_external": True,
+                  "allow_native_execution": False,
+              }
+              assert _resolve_mcp_mode(config=cfg) == MCP_MODE_FULL
+              assert _resolve_discover_external(config=cfg) is False
+              assert _resolve_allow_native_execution(config=cfg) is True
+
+
+          def test_registry_toolset_defaults_classify_native_execution_surfaces():
+              reg = ToolRegistry()
+              cases = (
+                  ("terminal", "terminal", ToolCapability.HOST_EXECUTION),
+                  ("read_file", "file", ToolCapability.FILESYSTEM_ACCESS),
+                  ("execute_code", "code_execution", ToolCapability.HOST_EXECUTION),
+                  ("computer_use", "computer_use", ToolCapability.UI_AUTOMATION),
+                  ("delegate_task", "delegation", ToolCapability.SPAWN_AGENT),
+                  ("cronjob", "cronjob", ToolCapability.SPAWN_AGENT),
+              )
+              for name, toolset, expected in cases:
+                  reg.register(
+                      name=name,
+                      toolset=toolset,
+                      schema=_schema(name),
+                      handler=lambda args, **kw: "",
+                  )
+                  assert expected in reg.get_tool_capabilities(name)
+
+
+          def test_explicit_capabilities_union_with_toolset_defaults():
+              reg = ToolRegistry()
+              reg.register(
+                  name="future_terminal_worker",
+                  toolset="terminal",
+                  schema=_schema("future_terminal_worker"),
+                  handler=lambda args, **kw: "",
+                  capabilities={ToolCapability.SPAWN_WORKER},
+              )
+              caps = reg.get_tool_capabilities("future_terminal_worker")
+              assert ToolCapability.HOST_EXECUTION in caps
+              assert ToolCapability.PROCESS_CONTROL in caps
+              assert ToolCapability.SPAWN_WORKER in caps
+
+
+          def test_safe_full_filters_by_capability_not_concrete_tool_name():
+              defs = {
+                  "future_ui_tool": {},
+                  "future_worker_tool": {},
+                  "memory": {},
+                  "external_mcp_tool": {},
+              }
+              caps = {
+                  "future_ui_tool": {ToolCapability.UI_AUTOMATION},
+                  "future_worker_tool": {ToolCapability.SPAWN_WORKER},
+                  "memory": set(),
+                  "external_mcp_tool": set(),
+              }
+              exposed = set(
+                  _resolve_exposed_tool_names(
+                      defs,
+                      mode="full",
+                      allow_native_execution=False,
+                      capabilities_by_name=caps,
+                  )
+              )
+              assert "future_ui_tool" not in exposed
+              assert "future_worker_tool" not in exposed
+              assert {"memory", "external_mcp_tool"} <= exposed
+
+
+          def test_trusted_full_includes_capability_marked_tools():
+              defs = {"terminal": {}, "computer_use": {}, "kanban_create": {}, "memory": {}}
+              caps = {
+                  "terminal": {ToolCapability.HOST_EXECUTION},
+                  "computer_use": {ToolCapability.UI_AUTOMATION},
+                  "kanban_create": {ToolCapability.SPAWN_WORKER},
+                  "memory": set(),
+              }
+              assert set(
+                  _resolve_exposed_tool_names(
+                      defs,
+                      mode="full",
+                      allow_native_execution=True,
+                      capabilities_by_name=caps,
+                  )
+              ) == set(defs)
+
+
+          def test_unsafe_capability_set_covers_execution_and_spawn_classes():
+              assert {
+                  ToolCapability.HOST_EXECUTION,
+                  ToolCapability.FILESYSTEM_ACCESS,
+                  ToolCapability.PROCESS_CONTROL,
+                  ToolCapability.UI_AUTOMATION,
+                  ToolCapability.SPAWN_AGENT,
+                  ToolCapability.SPAWN_WORKER,
+              } <= _MCP_UNSAFE_CAPABILITIES
+
+
+          def test_registered_escape_surfaces_are_classified():
+              import model_tools  # noqa: F401 - triggers built-in tool discovery
+              from tools.registry import registry
+
+              expected = {
+                  "terminal": ToolCapability.HOST_EXECUTION,
+                  "process": ToolCapability.PROCESS_CONTROL,
+                  "read_file": ToolCapability.FILESYSTEM_ACCESS,
+                  "write_file": ToolCapability.FILESYSTEM_ACCESS,
+                  "patch": ToolCapability.FILESYSTEM_ACCESS,
+                  "search_files": ToolCapability.FILESYSTEM_ACCESS,
+                  "execute_code": ToolCapability.HOST_EXECUTION,
+                  "computer_use": ToolCapability.UI_AUTOMATION,
+                  "delegate_task": ToolCapability.SPAWN_AGENT,
+                  "cronjob": ToolCapability.SPAWN_AGENT,
+                  "kanban_create": ToolCapability.SPAWN_WORKER,
+                  "kanban_unblock": ToolCapability.SPAWN_WORKER,
+                  "kanban_complete": ToolCapability.SPAWN_WORKER,
+              }
+              for name, capability in expected.items():
+                  assert capability in registry.get_tool_capabilities(name), name
+          PY
+
+      - name: Remove one-shot workflow from resulting commit
+        run: git rm .github/workflows/apply-mcp-capability-boundary.yml
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Targeted MCP tests
+        run: |
+          uv run pytest -q \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/agent/transports/test_hermes_tools_mcp_server.py \
+            tests/agent/transports/test_hermes_tools_mcp_agent_loop_routing.py \
+            tests/agent/transports/test_hermes_tools_mcp_context.py
+
+      - name: Ruff changed files
+        run: |
+          uv run ruff check \
+            tools/registry.py \
+            tools/kanban_tools.py \
+            agent/transports/hermes_tools_mcp_server.py \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/agent/transports/test_hermes_tools_mcp_server.py \
+            tests/agent/transports/test_hermes_tools_mcp_agent_loop_routing.py \
+            tests/agent/transports/test_hermes_tools_mcp_context.py
+
+      - name: Commit validated refactor
+        run: |
+          set -euo pipefail
+          git config user.name "Apichart Hanmuangjai"
+          git config user.email "luiapi.sys@gmail.com"
+          git add tools/registry.py tools/kanban_tools.py agent/transports/hermes_tools_mcp_server.py tests/agent/transports/test_hermes_tools_mcp_policy.py
+          git diff --cached --check
+          git commit -m "fix(mcp): enforce capability-based execution boundary"
+          git push origin HEAD:fix/mcp-capability-boundary
