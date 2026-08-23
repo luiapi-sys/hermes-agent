@@ -1,6 +1,9 @@
 name: MCP Full Surface Smoke
 
 on:
+  pull_request:
+    branches:
+      - feat/hermes-mcp-full-tools
   push:
     branches:
       - test/mcp-full-smoke
