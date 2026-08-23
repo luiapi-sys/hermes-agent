@@ -24,7 +24,6 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-          import textwrap
 
           path = Path(".github/workflows/apply-mcp-trusted-side-effect-boundary.yml")
           text = path.read_text()
@@ -33,8 +32,14 @@ jobs:
           assert text.count(start_marker) == 1, "apply-step start marker changed"
           start = text.index(start_marker) + len(start_marker)
           end = text.index(end_marker, start)
-          script = textwrap.dedent(text[start:end])
-          assert script.startswith("python - <<'PY'\n"), "unexpected apply script start"
+          block = text[start:end]
+          yaml_indent = "          "
+          lines = block.splitlines()
+          script = "\n".join(
+              line[len(yaml_indent):] if line.startswith(yaml_indent) else line
+              for line in lines
+          ) + "\n"
+          assert script.startswith("python - <<'PY'\n"), repr(script[:80])
           Path("/tmp/apply-capability-hardening.sh").write_text(script)
           PY
           bash /tmp/apply-capability-hardening.sh
