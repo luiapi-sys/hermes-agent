@@ -1,0 +1,185 @@
+name: MCP Policy Smoke
+
+on:
+  pull_request:
+    branches:
+      - fix/mcp-full-policy-hardening
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Config policy + real stdio MCP
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout validation snapshot
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Validate config-first policy against real MCP subprocesses
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-policy-smoke
+          HERMES_MCP_SESSION_ID: mcp-policy-smoke
+          HERMES_YOLO_MODE: "1"
+          HERMES_ACCEPT_HOOKS: "1"
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          mkdir -p "$HERMES_HOME"
+
+          cat > "$RUNNER_TEMP/ext_mcp.py" <<'PY'
+          from mcp.server.fastmcp import FastMCP
+
+          mcp = FastMCP("policy-smoke-external")
+
+          @mcp.tool()
+          def ext_echo(text: str) -> str:
+              return f"EXT:{text}"
+
+          if __name__ == "__main__":
+              mcp.run()
+          PY
+
+          write_config() {
+            local native="$1"
+            cat > "$HERMES_HOME/config.yaml" <<YAML
+          mcp:
+            hermes_tools:
+              mode: full
+              discover_external: true
+              allow_native_execution: ${native}
+          mcp_servers:
+            smoke_external:
+              command: "${GITHUB_WORKSPACE}/.venv/bin/python"
+              args:
+                - "${RUNNER_TEMP}/ext_mcp.py"
+              connect_timeout: 15
+              timeout: 30
+          YAML
+          }
+
+          source .venv/bin/activate
+
+          write_config false
+          python - <<'PY'
+          import asyncio
+          import os
+          from pathlib import Path
+
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          BOUNDARY = {
+              "terminal", "shell", "read_file", "write_file", "patch",
+              "search_files", "process", "execute_code", "delegate_task",
+          }
+
+          async def main():
+              params = StdioServerParameters(
+                  command=str(Path.cwd() / ".venv" / "bin" / "python"),
+                  args=["-m", "agent.transports.hermes_tools_mcp_server", "--verbose"],
+                  env=dict(os.environ),
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      listed = await session.list_tools()
+                      names = {tool.name for tool in listed.tools}
+                      print(f"SAFE_FULL tools/list count={len(names)}")
+                      leaked = sorted(names & BOUNDARY)
+                      assert not leaked, f"execution boundary leaked without opt-in: {leaked}"
+                      for required in ("memory", "session_search", "todo"):
+                          assert required in names, f"missing safe full-mode tool: {required}"
+                      external = next((name for name in names if "ext_echo" in name), None)
+                      assert external, "configured external MCP tool was not discovered"
+                      result = await session.call_tool(external, {"text": "safe"})
+                      text = "\n".join(getattr(i, "text", "") for i in result.content)
+                      assert "EXT:safe" in text, text
+                      print("MCP_POLICY_SAFE_OK")
+
+          asyncio.run(main())
+          PY
+
+          write_config true
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+          from pathlib import Path
+
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          def result_text(result):
+              return "\n".join(getattr(item, "text", "") for item in result.content)
+
+          async def main():
+              params = StdioServerParameters(
+                  command=str(Path.cwd() / ".venv" / "bin" / "python"),
+                  args=["-m", "agent.transports.hermes_tools_mcp_server", "--verbose"],
+                  env=dict(os.environ),
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      listed = await session.list_tools()
+                      tools = {tool.name: tool for tool in listed.tools}
+                      names = set(tools)
+                      print(f"TRUSTED_FULL tools/list count={len(names)}")
+                      for required in (
+                          "terminal", "read_file", "write_file", "patch",
+                          "memory", "session_search", "todo", "delegate_task",
+                      ):
+                          assert required in names, f"missing trusted full-mode tool: {required}"
+
+                      external = next((name for name in names if "ext_echo" in name), None)
+                      assert external, "configured external MCP tool was not discovered"
+
+                      todo_result = await session.call_tool(
+                          "todo",
+                          {"todos": [{"id": "policy-1", "content": "verify config policy", "status": "in_progress"}]},
+                      )
+                      assert "policy-1" in result_text(todo_result)
+
+                      terminal_schema = getattr(tools["terminal"], "inputSchema", None) or {}
+                      props = terminal_schema.get("properties") or {}
+                      if "command" in props:
+                          terminal_args = {"command": "printf mcp-policy-terminal"}
+                      elif "commands" in props:
+                          spec = props["commands"] or {}
+                          terminal_args = {
+                              "commands": ["printf mcp-policy-terminal"]
+                              if spec.get("type") == "array"
+                              else "printf mcp-policy-terminal"
+                          }
+                      else:
+                          raise AssertionError(f"unexpected terminal schema: {json.dumps(terminal_schema)}")
+
+                      terminal_result = await session.call_tool("terminal", terminal_args)
+                      assert "mcp-policy-terminal" in result_text(terminal_result)
+
+                      external_result = await session.call_tool(external, {"text": "trusted"})
+                      assert "EXT:trusted" in result_text(external_result)
+                      print("MCP_POLICY_TRUSTED_OK")
+
+          asyncio.run(main())
+          PY
