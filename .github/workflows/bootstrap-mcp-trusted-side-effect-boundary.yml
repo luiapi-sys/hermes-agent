@@ -62,12 +62,11 @@ jobs:
           helper_new = '    count = text.count(old)\n    if label == "get_tool_definitions signature":\n        assert count >= 1, f"{label}: expected at least one match, got {count}"\n    else:\n        assert count == 1, f"{label}: expected exactly one match, got {count}"\n    return text.replace(old, new, 1)\n'
           assert script.count(helper_old) == 1, "replace_once helper changed"
           script = script.replace(helper_old, helper_new, 1)
-
           Path("/tmp/apply-capability-hardening.sh").write_text(script)
           PY
           bash /tmp/apply-capability-hardening.sh
 
-      - name: Close safe-to-trusted plugin-discovery state leak
+      - name: Refine trusted compatibility and plugin state
         shell: bash
         run: |
           python - <<'PY'
@@ -75,13 +74,37 @@ jobs:
 
           path = Path("agent/transports/hermes_tools_mcp_server.py")
           text = path.read_text()
-          old = (
+
+          call_old = (
+              "    all_defs = list(\n"
+              "        get_tool_definitions(\n"
+              "            quiet_mode=True,\n"
+              "            skip_tool_search_assembly=True,\n"
+              "            excluded_capabilities=(\n"
+              "                None if allow_native_execution else set(_MCP_UNSAFE_CAPABILITIES)\n"
+              "            ),\n"
+              "        )\n"
+              "    )\n"
+          )
+          call_new = (
+              "    definition_kwargs = {\n"
+              "        \"quiet_mode\": True,\n"
+              "        \"skip_tool_search_assembly\": True,\n"
+              "    }\n"
+              "    if not allow_native_execution:\n"
+              "        definition_kwargs[\"excluded_capabilities\"] = set(_MCP_UNSAFE_CAPABILITIES)\n"
+              "    all_defs = list(get_tool_definitions(**definition_kwargs))\n"
+          )
+          assert text.count(call_old) == 1, "MCP definition call shape changed"
+          text = text.replace(call_old, call_new, 1)
+
+          plugin_old = (
               "    if not allow_native_execution:\n"
               "        os.environ[\"HERMES_SKIP_PLUGIN_DISCOVERY\"] = \"1\"\n"
               "\n"
               "    from model_tools import get_tool_definitions, handle_function_call\n"
           )
-          new = (
+          plugin_new = (
               "    if not allow_native_execution:\n"
               "        os.environ[\"HERMES_SKIP_PLUGIN_DISCOVERY\"] = \"1\"\n"
               "    else:\n"
@@ -97,8 +120,8 @@ jobs:
               "        except Exception as exc:\n"
               "            logger.debug(\"Trusted MCP plugin discovery failed: %s\", exc)\n"
           )
-          assert text.count(old) == 1, "plugin-discovery policy block changed"
-          path.write_text(text.replace(old, new, 1))
+          assert text.count(plugin_old) == 1, "plugin-discovery policy block changed"
+          path.write_text(text.replace(plugin_old, plugin_new, 1))
 
           test_path = Path("tests/agent/transports/test_hermes_tools_mcp_trust_boundary.py")
           test_text = test_path.read_text()
