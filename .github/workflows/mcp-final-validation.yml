@@ -73,13 +73,12 @@ jobs:
           rm -f "$EXT_MCP_MARKER"
 
           cat > "$RUNNER_TEMP/ext_mcp.py" <<'PY'
-          import os
+          import sys
           from pathlib import Path
           from mcp.server.fastmcp import FastMCP
 
-          marker = os.environ.get("EXT_MCP_MARKER")
-          if marker:
-              Path(marker).write_text("started\n")
+          if len(sys.argv) > 1:
+              Path(sys.argv[1]).write_text("started\n")
 
           mcp = FastMCP("policy-smoke-external")
 
@@ -104,6 +103,7 @@ jobs:
               command: "${GITHUB_WORKSPACE}/.venv/bin/python"
               args:
                 - "${RUNNER_TEMP}/ext_mcp.py"
+                - "${EXT_MCP_MARKER}"
               connect_timeout: 15
               timeout: 30
           YAML
