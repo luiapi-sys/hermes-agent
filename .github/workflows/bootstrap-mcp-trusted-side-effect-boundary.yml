@@ -48,10 +48,6 @@ jobs:
                   if positions:
                       _, triple = min(positions)
               else:
-                  # Interior lines are literal string content and may
-                  # intentionally start with 10+ spaces. Preserve them verbatim.
-                  # A line containing the matching delimiter is Python source
-                  # again, so remove the YAML indentation from that line only.
                   if triple in raw and raw.count(triple) % 2 == 1:
                       line = candidate
                       triple = None
@@ -61,6 +57,12 @@ jobs:
           assert triple is None, "unterminated triple-quoted literal in extracted script"
           script = "\n".join(output) + "\n"
           assert script.startswith("python - <<'PY'\n"), repr(script[:80])
+
+          helper_old = '''    count = text.count(old)\n    assert count == 1, f"{label}: expected exactly one match, got {count}"\n    return text.replace(old, new, 1)\n'''
+          helper_new = '''    count = text.count(old)\n    if label == "get_tool_definitions signature":\n        assert count >= 1, f"{label}: expected at least one match, got {count}"\n    else:\n        assert count == 1, f"{label}: expected exactly one match, got {count}"\n    return text.replace(old, new, 1)\n'''
+          assert script.count(helper_old) == 1, "replace_once helper changed"
+          script = script.replace(helper_old, helper_new, 1)
+
           Path("/tmp/apply-capability-hardening.sh").write_text(script)
           PY
           bash /tmp/apply-capability-hardening.sh
@@ -85,9 +87,6 @@ jobs:
 
           from model_tools import get_tool_definitions, handle_function_call
 
-          # model_tools may already be cached from a prior safe build in the same
-          # process. Re-run idempotent plugin discovery after trust is enabled so
-          # safe -> trusted transitions restore the explicitly trusted surface.
           if allow_native_execution:
               try:
                   from hermes_cli.plugins import discover_plugins
@@ -105,11 +104,7 @@ jobs:
           if "from pathlib import Path\n" not in test_text:
               future = "from __future__ import annotations\n"
               assert test_text.startswith(future), "unexpected test module preamble"
-              test_text = test_text.replace(
-                  future,
-                  future + "\nfrom pathlib import Path\n",
-                  1,
-              )
+              test_text = test_text.replace(future, future + "\nfrom pathlib import Path\n", 1)
           test_path.write_text(test_text)
           PY
 
