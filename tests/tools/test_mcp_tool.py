@@ -1022,6 +1022,9 @@ class TestDiscoverAndRegister:
         assert "mcp__fs__write_file" in registered
         assert "mcp__fs__read_file" in mock_registry.get_all_tool_names()
         assert "mcp__fs__write_file" in mock_registry.get_all_tool_names()
+        from tools.registry import ToolCapability
+        assert ToolCapability.EXTERNAL_MCP in mock_registry.get_tool_capabilities("mcp__fs__read_file")
+        assert ToolCapability.EXTERNAL_MCP in mock_registry.get_tool_capabilities("mcp__fs__write_file")
 
         _servers.pop("fs", None)
 
