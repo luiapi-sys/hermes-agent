@@ -414,7 +414,7 @@ async def send_dm(
 # Registry registration
 # ---------------------------------------------------------------------------
 
-from tools.registry import registry, tool_result  # noqa: E402
+from tools.registry import ToolCapability, registry, tool_result  # noqa: E402
 
 
 def _check_yuanbao():
@@ -646,6 +646,7 @@ registry.register(
     },
     handler=_handle_yb_send_dm,
     check_fn=_check_yuanbao,
+    capabilities={ToolCapability.REMOTE_MUTATION, ToolCapability.FILESYSTEM_ACCESS},
     is_async=True,
     emoji="✉️",
 )
@@ -732,6 +733,7 @@ registry.register(
     },
     handler=_handle_yb_send_sticker,
     check_fn=_check_yuanbao,
+    capabilities={ToolCapability.REMOTE_MUTATION},
     is_async=True,
     emoji="🎨",
 )

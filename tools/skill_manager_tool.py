@@ -1619,7 +1619,7 @@ SKILL_MANAGE_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error
+from tools.registry import ToolCapability, registry, tool_error
 
 registry.register(
     name="skill_manage",
@@ -1636,5 +1636,9 @@ registry.register(
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into")),
+    capabilities={
+        ToolCapability.FILESYSTEM_ACCESS,
+        ToolCapability.HOST_EXECUTION,
+    },
     emoji="📝",
 )

@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from tools.registry import registry
+from tools.registry import ToolCapability, registry
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1107,6 +1107,7 @@ registry.register(
     handler=_make_handler(discord_core),
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
+    capabilities={ToolCapability.REMOTE_MUTATION},
 )
 
 registry.register(
@@ -1116,4 +1117,5 @@ registry.register(
     handler=_make_handler(discord_admin_handler),
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
+    capabilities={ToolCapability.REMOTE_MUTATION},
 )

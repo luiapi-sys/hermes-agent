@@ -42,6 +42,7 @@ class ToolCapability:
     SPAWN_AGENT = "spawn_agent"
     SPAWN_WORKER = "spawn_worker"
     EXTERNAL_MCP = "external_mcp"
+    REMOTE_MUTATION = "remote_mutation"
 
 
 _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
@@ -55,6 +56,26 @@ _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
     ),
     "delegation": frozenset({ToolCapability.SPAWN_AGENT}),
     "cronjob": frozenset({ToolCapability.SPAWN_AGENT}),
+    "browser": frozenset(
+        {
+            ToolCapability.UI_AUTOMATION,
+            ToolCapability.PROCESS_CONTROL,
+            ToolCapability.FILESYSTEM_ACCESS,
+        }
+    ),
+    "browser-cdp": frozenset(
+        {ToolCapability.UI_AUTOMATION, ToolCapability.FILESYSTEM_ACCESS}
+    ),
+    "tts": frozenset(
+        {
+            ToolCapability.FILESYSTEM_ACCESS,
+            ToolCapability.HOST_EXECUTION,
+            ToolCapability.PROCESS_CONTROL,
+        }
+    ),
+    "vision": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "video": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "image_gen": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
 }
 
 
@@ -570,7 +591,12 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
+    def get_definitions(
+        self,
+        tool_names: Set[str],
+        quiet: bool = False,
+        excluded_capabilities: Set[str] = None,
+    ) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
         Only tools whose ``check_fn()`` returns True (or have no check_fn)
@@ -582,6 +608,7 @@ class ToolRegistry:
         flush on every call.
         """
         result = []
+        excluded = frozenset(excluded_capabilities or ())
         # Per-call cache on top of the 30 s TTL — handles repeat probes of the
         # same check_fn within one definitions pass without re-reading the
         # TTL clock.
@@ -590,6 +617,16 @@ class ToolRegistry:
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:
+                continue
+            # Security transports can reject a capability class before any
+            # availability probe runs. Some check_fn implementations launch
+            # subprocesses or probe host services, so post-filtering is too late.
+            if excluded and entry.capabilities & excluded:
+                if not quiet:
+                    logger.debug(
+                        "Tool %s excluded by capability policy before availability check",
+                        name,
+                    )
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
