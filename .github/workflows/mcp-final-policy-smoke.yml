@@ -15,7 +15,6 @@ jobs:
     timeout-minutes: 20
     env:
       HERMES_INTERACTIVE: "1"
-      HERMES_KANBAN_TASK: "mcp-final-policy-smoke"
     steps:
       - name: Checkout exact validation snapshot
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -121,6 +120,8 @@ jobs:
           write_config() {
             local native="$1"
             cat > "$HERMES_HOME/config.yaml" <<YAML
+          toolsets:
+            - kanban
           mcp:
             hermes_tools:
               mode: full
@@ -139,6 +140,7 @@ jobs:
           }
 
           source .venv/bin/activate
+          unset HERMES_KANBAN_TASK || true
 
           rm -f "$MCP_SMOKE_SENTINEL"
           write_config false
@@ -169,7 +171,7 @@ jobs:
                       assert not leaked, f"unsafe capabilities leaked into safe-full: {leaked}"
                       external = sorted(n for n in names if "ext_echo" in n or n.startswith("mcp__smoke_external__"))
                       assert not external, f"external MCP leaked into safe-full: {external}"
-                      for required in ("memory", "session_search", "todo"):
+                      for required in ("memory", "session_search", "todo", "kanban_list"):
                           assert required in names, f"missing safe tool: {required}"
                       assert not Path(os.environ["MCP_SMOKE_SENTINEL"]).exists(), (
                           "safe-full launched configured external stdio MCP process"
@@ -209,7 +211,7 @@ jobs:
                           "terminal", "process", "read_file", "write_file", "patch",
                           "execute_code", "memory", "session_search", "todo",
                           "delegate_task", "cronjob", "kanban_create",
-                          "kanban_unblock", "kanban_complete",
+                          "kanban_unblock", "kanban_complete", "kanban_list",
                       ):
                           assert required in tools, f"missing trusted tool: {required}"
                       external = next((n for n in tools if "ext_echo" in n), None)
