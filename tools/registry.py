@@ -41,6 +41,7 @@ class ToolCapability:
     UI_AUTOMATION = "ui_automation"
     SPAWN_AGENT = "spawn_agent"
     SPAWN_WORKER = "spawn_worker"
+    EXTERNAL_MCP = "external_mcp"
 
 
 _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {

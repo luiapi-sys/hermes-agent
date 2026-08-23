@@ -24,8 +24,8 @@ User-facing behavior is configured in ``config.yaml`` under
     supported by the MCP context bridge.
 
 For security, full mode filters registry tools carrying host-execution,
-filesystem, process-control, UI-automation, agent-spawn, or worker-spawn
-capabilities by default. Classification lives in the central tool registry so
+filesystem, process-control, UI-automation, agent-spawn, worker-spawn, or
+external-MCP capabilities by default. Classification lives in the central tool registry so
 future tools inherit the boundary from their toolset or explicit metadata. A
 trusted external MCP deployment (for example a dedicated ChatGPT remote MCP
 gateway) that intentionally wants the complete native surface must also set
@@ -70,6 +70,7 @@ _MCP_UNSAFE_CAPABILITIES: frozenset[str] = frozenset(
         ToolCapability.UI_AUTOMATION,
         ToolCapability.SPAWN_AGENT,
         ToolCapability.SPAWN_WORKER,
+        ToolCapability.EXTERNAL_MCP,
     }
 )
 

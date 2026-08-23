@@ -127,7 +127,7 @@ def test_safe_full_filters_by_capability_not_concrete_tool_name():
         "future_ui_tool": {ToolCapability.UI_AUTOMATION},
         "future_worker_tool": {ToolCapability.SPAWN_WORKER},
         "memory": set(),
-        "external_mcp_tool": set(),
+        "external_mcp_tool": {ToolCapability.EXTERNAL_MCP},
     }
     exposed = set(
         _resolve_exposed_tool_names(
@@ -139,7 +139,8 @@ def test_safe_full_filters_by_capability_not_concrete_tool_name():
     )
     assert "future_ui_tool" not in exposed
     assert "future_worker_tool" not in exposed
-    assert {"memory", "external_mcp_tool"} <= exposed
+    assert "external_mcp_tool" not in exposed
+    assert "memory" in exposed
 
 
 def test_trusted_full_includes_capability_marked_tools():
@@ -168,6 +169,7 @@ def test_unsafe_capability_set_covers_execution_and_spawn_classes():
         ToolCapability.UI_AUTOMATION,
         ToolCapability.SPAWN_AGENT,
         ToolCapability.SPAWN_WORKER,
+        ToolCapability.EXTERNAL_MCP,
     } <= _MCP_UNSAFE_CAPABILITIES
 
 
