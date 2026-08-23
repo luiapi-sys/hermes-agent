@@ -13,6 +13,8 @@ jobs:
     name: MCP policy + stdio smoke
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      HERMES_INTERACTIVE: "1"
     steps:
       - name: Checkout validation snapshot
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -116,18 +118,17 @@ jobs:
               async with stdio_client(params) as (read, write):
                   async with ClientSession(read, write) as session:
                       await session.initialize()
-                      listed = await session.list_tools()
-                      names = {tool.name for tool in listed.tools}
-                      print(f"SAFE_FULL tools/list count={len(names)}")
+                      names = {tool.name for tool in (await session.list_tools()).tools}
                       leaked = sorted(names & BOUNDARY)
-                      assert not leaked, f"execution boundary leaked without opt-in: {leaked}"
+                      assert not leaked, f"safe-full execution boundary leaked: {leaked}"
                       for required in ("memory", "session_search", "todo"):
-                          assert required in names, f"missing safe full-mode tool: {required}"
+                          assert required in names, f"missing safe full tool: {required}"
                       external = next((name for name in names if "ext_echo" in name), None)
-                      assert external, "configured external MCP tool was not discovered"
+                      assert external, "external MCP tool missing in safe-full"
                       result = await session.call_tool(external, {"text": "safe"})
-                      text = "\n".join(getattr(i, "text", "") for i in result.content)
+                      text = "\n".join(getattr(item, "text", "") for item in result.content)
                       assert "EXT:safe" in text, text
+                      print(f"SAFE_FULL count={len(names)}")
                       print("MCP_POLICY_SAFE_CRONJOB_OK")
 
           asyncio.run(main())
@@ -154,37 +155,31 @@ jobs:
               async with stdio_client(params) as (read, write):
                   async with ClientSession(read, write) as session:
                       await session.initialize()
-                      listed = await session.list_tools()
-                      tools = {tool.name: tool for tool in listed.tools}
-                      names = set(tools)
-                      print(f"TRUSTED_FULL tools/list count={len(names)}")
+                      tools = {tool.name: tool for tool in (await session.list_tools()).tools}
                       for required in (
                           "terminal", "read_file", "write_file", "patch", "memory",
                           "session_search", "todo", "delegate_task", "cronjob",
                       ):
-                          assert required in names, f"missing trusted full-mode tool: {required}"
+                          assert required in tools, f"missing trusted full tool: {required}"
 
-                      external = next((name for name in names if "ext_echo" in name), None)
-                      assert external, "configured external MCP tool was not discovered"
+                      external = next((name for name in tools if "ext_echo" in name), None)
+                      assert external, "external MCP tool missing in trusted-full"
 
-                      terminal_schema = getattr(tools["terminal"], "inputSchema", None) or {}
-                      props = terminal_schema.get("properties") or {}
+                      schema = getattr(tools["terminal"], "inputSchema", None) or {}
+                      props = schema.get("properties") or {}
                       if "command" in props:
-                          terminal_args = {"command": "printf mcp-policy-terminal"}
+                          args = {"command": "printf mcp-policy-terminal"}
                       elif "commands" in props:
                           spec = props["commands"] or {}
-                          terminal_args = {
-                              "commands": ["printf mcp-policy-terminal"]
-                              if spec.get("type") == "array"
-                              else "printf mcp-policy-terminal"
-                          }
+                          args = {"commands": ["printf mcp-policy-terminal"] if spec.get("type") == "array" else "printf mcp-policy-terminal"}
                       else:
-                          raise AssertionError(f"unexpected terminal schema: {json.dumps(terminal_schema)}")
+                          raise AssertionError(f"unexpected terminal schema: {json.dumps(schema)}")
 
-                      terminal_result = await session.call_tool("terminal", terminal_args)
+                      terminal_result = await session.call_tool("terminal", args)
                       assert "mcp-policy-terminal" in result_text(terminal_result)
-                      external_result = await session.call_tool(external, {"text": "trusted"})
-                      assert "EXT:trusted" in result_text(external_result)
+                      ext_result = await session.call_tool(external, {"text": "trusted"})
+                      assert "EXT:trusted" in result_text(ext_result)
+                      print(f"TRUSTED_FULL count={len(tools)}")
                       print("MCP_POLICY_TRUSTED_CRONJOB_OK")
 
           asyncio.run(main())
