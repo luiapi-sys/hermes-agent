@@ -20,13 +20,13 @@ User-facing behavior is configured in ``config.yaml`` under
 
 ``mode: full``
     Expose every currently available Hermes tool definition from the registry,
-    including configured external MCP tools and the four agent-loop tools
-    (``delegate_task``, ``memory``, ``session_search`` and ``todo``) through the
-    MCP context bridge.
+    including configured external MCP tools and the stateful agent-loop tools
+    supported by the MCP context bridge.
 
 For security, full mode does *not* expose Hermes' native shell/file/process
-surface by default. Those tools execute outside Codex's own sandbox/approval
-boundary. A trusted external MCP deployment (for example a dedicated ChatGPT
+surface or ``delegate_task`` by default. Those capabilities can execute outside
+a coding client's own sandbox/approval boundary, directly or through a child
+agent. A trusted external MCP deployment (for example a dedicated ChatGPT
 remote MCP gateway) that intentionally wants the complete native surface must
 also set ``mcp.hermes_tools.allow_native_execution: true``.
 
@@ -58,7 +58,8 @@ MCP_MODE_FULL = "full"
 _VALID_MCP_MODES = {MCP_MODE_CURATED, MCP_MODE_FULL}
 
 # Native Hermes tools that can bypass a coding client's own sandbox / approval
-# layer. Full mode keeps these hidden unless the operator explicitly opts in.
+# layer. delegate_task is also gated because a child agent can inherit native
+# execution toolsets and would otherwise provide an indirect bypass.
 _NATIVE_BOUNDARY_TOOLS: frozenset[str] = frozenset(
     {
         "terminal",
@@ -69,6 +70,7 @@ _NATIVE_BOUNDARY_TOOLS: frozenset[str] = frozenset(
         "search_files",
         "process",
         "execute_code",
+        "delegate_task",
     }
 )
 
@@ -329,10 +331,10 @@ def _build_server() -> Any:
             "Hermes Agent tool surface exposed over MCP. Curated mode contains "
             "the Codex-safe Hermes-specific subset. Full mode contains every "
             "currently available built-in, plugin and configured external MCP "
-            "registry tool, including delegate_task, memory, session_search and "
-            "todo through the MCP agent-context bridge. Native shell/file/process "
-            "tools are included only when allow_native_execution is explicitly "
-            "enabled in the Hermes MCP policy."
+            "registry tool allowed by the MCP policy. Stateful agent-loop tools "
+            "are supported through the MCP context bridge. Native shell/file/process "
+            "tools and delegate_task are included only when allow_native_execution "
+            "is explicitly enabled."
         ),
     )
 
@@ -369,13 +371,14 @@ def _build_server() -> Any:
 
     # Only full mode needs the stateful bridge. Curated mode keeps the exact
     # historical Codex behavior and never initializes memory/session/delegation
-    # context as a side effect.
+    # context as a side effect. The bridge receives only policy-exposed names so
+    # future context-sensitive tools cannot inherit hidden native capabilities.
     agent_context_bridge = None
     if mode == MCP_MODE_FULL:
         from agent.transports.hermes_tools_mcp_context import MCPAgentContextBridge
 
         agent_context_bridge = MCPAgentContextBridge(
-            available_tool_names=tuple(sorted(all_defs)),
+            available_tool_names=tuple(name for name in tool_names if name in all_defs),
         )
 
     exposed_count = 0
