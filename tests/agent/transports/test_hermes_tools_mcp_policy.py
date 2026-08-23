@@ -72,6 +72,10 @@ def test_legacy_process_override_remains_supported(monkeypatch):
     assert _resolve_allow_native_execution(config=cfg) is True
 
 
+def test_cronjob_is_part_of_native_execution_boundary():
+    assert "cronjob" in _NATIVE_BOUNDARY_TOOLS
+
+
 def test_full_mode_protects_native_boundary_without_explicit_opt_in():
     defs = {
         "terminal": {},
