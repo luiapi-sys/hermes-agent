@@ -27,6 +27,41 @@ jobs:
             python scripts/apply_mcp_fail_closed_capabilities.py
           fi
 
+      - name: Preserve trusted-mode compatibility
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected one match, got {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "agent/transports/hermes_tools_mcp_server.py",
+              '''    if allow_native_execution:\n        return tuple(name for name in EXPOSED_TOOLS if name in all_defs)\n''',
+              '''    if allow_native_execution:\n        return EXPOSED_TOOLS\n''',
+              "trusted curated compatibility",
+          )
+
+          replace_once(
+              "agent/transports/hermes_tools_mcp_server.py",
+              '''            get_tool_definitions(\n                quiet_mode=True,\n                skip_tool_search_assembly=True,\n                exclude_capabilities=(\n                    None if allow_native_execution else set(_MCP_UNSAFE_CAPABILITIES)\n                ),\n                require_capabilities=(\n                    {ToolCapability.MCP_SAFE}\n                    if mode == MCP_MODE_FULL and not allow_native_execution\n                    else None\n                ),\n            )\n''',
+              '''            get_tool_definitions(\n                **(\n                    {\n                        "quiet_mode": True,\n                        "skip_tool_search_assembly": True,\n                    }\n                    if allow_native_execution\n                    else {\n                        "quiet_mode": True,\n                        "skip_tool_search_assembly": True,\n                        "exclude_capabilities": set(_MCP_UNSAFE_CAPABILITIES),\n                        **(\n                            {"require_capabilities": {ToolCapability.MCP_SAFE}}\n                            if mode == MCP_MODE_FULL\n                            else {}\n                        ),\n                    }\n                )\n            )\n''',
+              "trusted get_tool_definitions kwargs",
+          )
+
+          replace_once(
+              "tests/agent/transports/test_hermes_tools_mcp_policy.py",
+              '        "memory": set(),\n',
+              '        "memory": {ToolCapability.MCP_SAFE},\n',
+              "memory explicit-safe expectation",
+          )
+          PY
+
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
         with:
