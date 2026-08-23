@@ -4,7 +4,9 @@ from agent.transports.hermes_tools_mcp_context import (
     AGENT_LOOP_TOOLS,
     MCPAgentContextBridge,
     MCP_SESSION_ENV,
+    _AgentLoopToolSetProxy,
     _DelegateParentContext,
+    _MCP_DISPATCH_LOCAL,
 )
 
 
@@ -22,74 +24,60 @@ def test_bridge_supports_exact_agent_loop_tools():
     bridge.close()
 
 
-def test_todo_dispatch_injects_store(monkeypatch):
-    from tools.registry import registry
+def test_agent_loop_guard_bypass_is_one_shot_and_thread_local():
+    proxy = _AgentLoopToolSetProxy({"todo", "memory"})
+    previous = getattr(_MCP_DISPATCH_LOCAL, "bypass_once", None)
+    try:
+        _MCP_DISPATCH_LOCAL.bypass_once = {"todo": 1}
+        assert "todo" not in proxy
+        # The bypass is consumed by the first membership check only.
+        assert "todo" in proxy
+        assert "memory" in proxy
+    finally:
+        if previous is None:
+            try:
+                delattr(_MCP_DISPATCH_LOCAL, "bypass_once")
+            except AttributeError:
+                pass
+        else:
+            _MCP_DISPATCH_LOCAL.bypass_once = previous
 
+
+def test_todo_context_contains_process_local_store():
     bridge = MCPAgentContextBridge()
     store = object()
     bridge._todo_store = store
-    seen = {}
-
-    def fake_dispatch(name, args, **kwargs):
-        seen.update(name=name, args=args, kwargs=kwargs)
-        return "ok"
-
-    monkeypatch.setattr(registry, "dispatch", fake_dispatch)
-    assert bridge.dispatch("todo", {"todos": []}) == "ok"
-    assert seen["name"] == "todo"
-    assert seen["kwargs"]["store"] is store
+    assert bridge._context_for("todo") == {"store": store}
     bridge.close()
 
 
-def test_memory_dispatch_injects_store(monkeypatch):
-    from tools.registry import registry
-
+def test_memory_context_contains_profile_store():
     bridge = MCPAgentContextBridge()
     store = object()
     bridge._memory_store = store
-    seen = {}
-
-    def fake_dispatch(name, args, **kwargs):
-        seen.update(name=name, args=args, kwargs=kwargs)
-        return "ok"
-
-    monkeypatch.setattr(registry, "dispatch", fake_dispatch)
-    assert bridge.dispatch("memory", {"action": "add", "content": "x"}) == "ok"
-    assert seen["name"] == "memory"
-    assert seen["kwargs"]["store"] is store
+    assert bridge._context_for("memory") == {"store": store}
     bridge.close()
 
 
-def test_session_search_dispatch_injects_db_and_current_session(monkeypatch):
-    from tools.registry import registry
-
+def test_session_search_context_contains_db_and_current_session(monkeypatch):
     bridge = MCPAgentContextBridge()
     db = object()
     bridge._session_db = db
     monkeypatch.setenv(MCP_SESSION_ENV, "mcp-session-123")
-    seen = {}
 
-    def fake_dispatch(name, args, **kwargs):
-        seen.update(name=name, args=args, kwargs=kwargs)
-        return "ok"
-
-    monkeypatch.setattr(registry, "dispatch", fake_dispatch)
-    assert bridge.dispatch("session_search", {"query": "deploy"}) == "ok"
-    assert seen["name"] == "session_search"
-    assert seen["kwargs"]["db"] is db
-    assert seen["kwargs"]["current_session_id"] == "mcp-session-123"
+    context = bridge._context_for("session_search")
+    assert context["db"] is db
+    assert context["current_session_id"] == "mcp-session-123"
     bridge.close()
 
 
-def test_delegate_dispatch_injects_parent_and_declares_stateless(monkeypatch):
+def test_delegate_context_contains_parent_and_declares_stateless(monkeypatch):
     from gateway import session_context
-    from tools.registry import registry
 
     bridge = MCPAgentContextBridge(available_tool_names=("terminal", "read_file"))
     parent = object()
     bridge._delegate_parent = parent
     declared = []
-    seen = {}
 
     monkeypatch.setattr(
         session_context,
@@ -97,19 +85,96 @@ def test_delegate_dispatch_injects_parent_and_declares_stateless(monkeypatch):
         lambda: declared.append(True),
     )
 
-    def fake_dispatch(name, args, **kwargs):
-        seen.update(name=name, args=args, kwargs=kwargs)
-        return "ok"
-
-    monkeypatch.setattr(registry, "dispatch", fake_dispatch)
-    assert bridge.dispatch("delegate_task", {"goal": "inspect project"}) == "ok"
+    context = bridge._context_for("delegate_task")
     assert declared == [True]
-    assert seen["name"] == "delegate_task"
-    assert seen["kwargs"]["parent_agent"] is parent
+    assert context["parent_agent"] is parent
     bridge.close()
 
 
-def test_unknown_tool_is_rejected_before_registry_dispatch():
+def test_dispatch_reenters_model_tools_and_injects_context_at_registry_handler(monkeypatch):
+    """The MCP bridge must preserve handle_function_call as the dispatcher."""
+    import model_tools
+    from tools.registry import registry
+
+    bridge = MCPAgentContextBridge()
+    store = object()
+    bridge._todo_store = store
+
+    entry = registry.get_entry("todo")
+    assert entry is not None
+    seen = {}
+
+    def original_handler(args, **kwargs):
+        seen["handler_args"] = args
+        seen["handler_kwargs"] = kwargs
+        return "ok"
+
+    monkeypatch.setattr(entry, "handler", original_handler)
+    monkeypatch.setattr(
+        model_tools,
+        "_AGENT_LOOP_TOOLS",
+        {"todo", "memory", "session_search", "delegate_task"},
+    )
+
+    def fake_handle_function_call(name, args, **kwargs):
+        # Simulate the exact guard + registry-dispatch seam in model_tools.
+        # The first membership test must be bypassed, then normal membership
+        # must immediately return for later/nested calls.
+        seen["guard_bypassed"] = name not in model_tools._AGENT_LOOP_TOOLS
+        seen["guard_restored"] = name in model_tools._AGENT_LOOP_TOOLS
+        seen["dispatcher_kwargs"] = kwargs
+        return registry.get_entry(name).handler(args)
+
+    monkeypatch.setattr(model_tools, "handle_function_call", fake_handle_function_call)
+
+    assert bridge.dispatch("todo", {"todos": []}) == "ok"
+    assert seen["guard_bypassed"] is True
+    assert seen["guard_restored"] is True
+    assert seen["handler_args"] == {"todos": []}
+    assert seen["handler_kwargs"]["store"] is store
+    bridge.close()
+
+
+def test_existing_handler_context_wins_over_mcp_fallback(monkeypatch):
+    """A real child AIAgent's state must not be overwritten by MCP fallback."""
+    import model_tools
+    from tools.registry import registry
+
+    bridge = MCPAgentContextBridge()
+    mcp_store = object()
+    child_store = object()
+    bridge._todo_store = mcp_store
+
+    entry = registry.get_entry("todo")
+    assert entry is not None
+    seen = {}
+
+    def original_handler(args, **kwargs):
+        seen.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(entry, "handler", original_handler)
+    monkeypatch.setattr(
+        model_tools,
+        "_AGENT_LOOP_TOOLS",
+        {"todo", "memory", "session_search", "delegate_task"},
+    )
+
+    # Install the wrapper using bridge.dispatch infrastructure, but simulate a
+    # nested/child handler invocation that already carries its own store.
+    def fake_handle_function_call(name, args, **kwargs):
+        assert name not in model_tools._AGENT_LOOP_TOOLS
+        wrapped = registry.get_entry(name).handler
+        return wrapped(args, store=child_store)
+
+    monkeypatch.setattr(model_tools, "handle_function_call", fake_handle_function_call)
+
+    assert bridge.dispatch("todo", {}) == "ok"
+    assert seen["store"] is child_store
+    bridge.close()
+
+
+def test_unknown_tool_is_rejected_before_dispatch():
     bridge = MCPAgentContextBridge()
     try:
         bridge.dispatch("terminal", {})
