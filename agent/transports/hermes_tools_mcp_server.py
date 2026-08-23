@@ -13,11 +13,16 @@ This module supports two exposure modes controlled by ``HERMES_MCP_MODE``:
 
 ``full``
     Expose every Hermes tool definition that is currently available from the
-    registry. The raw pre-Tool-Search catalog is used so progressive disclosure
-    cannot hide tools from the MCP server. Availability checks still apply.
-    The four agent-loop tools (``delegate_task``, ``memory``, ``session_search``
-    and ``todo``) are routed through a dedicated MCP context bridge so their
-    normal registered handlers receive the state they require.
+    registry. Configured external MCP servers are discovered before the raw
+    pre-Tool-Search catalog is snapshotted, so plugin/MCP tools are included as
+    well as built-ins. Availability checks still apply. The four agent-loop
+    tools (``delegate_task``, ``memory``, ``session_search`` and ``todo``) are
+    routed through a dedicated MCP context bridge while still executing through
+    ``model_tools.handle_function_call()``.
+
+External MCP discovery is enabled by default in full mode. Set
+``HERMES_MCP_DISCOVER_EXTERNAL=0`` to skip it when fast/offline startup is more
+important than a complete configured MCP surface.
 
 Run with: python -m agent.transports.hermes_tools_mcp_server
 Spawned by: CodexAppServerSession.ensure_started() when the runtime is active
@@ -36,6 +41,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 MCP_MODE_ENV = "HERMES_MCP_MODE"
+MCP_DISCOVER_EXTERNAL_ENV = "HERMES_MCP_DISCOVER_EXTERNAL"
 MCP_MODE_CURATED = "curated"
 MCP_MODE_FULL = "full"
 _VALID_MCP_MODES = {MCP_MODE_CURATED, MCP_MODE_FULL}
@@ -109,6 +115,19 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("invalid %s=%r; using default=%s", name, raw, default)
+    return default
+
+
 def _resolve_mcp_mode(value: str | None = None) -> str:
     """Resolve and validate the MCP exposure mode.
 
@@ -140,6 +159,34 @@ def _resolve_exposed_tool_names(
     return EXPOSED_TOOLS
 
 
+def _discover_external_mcp_tools(mode: str) -> None:
+    """Discover configured external MCP tools before the full-mode snapshot.
+
+    Discovery is intentionally synchronous here. Unlike interactive Hermes
+    entry points, this server registers a static FastMCP tool surface once at
+    startup; a background discovery that finishes later would mutate the Hermes
+    registry but would not retroactively add those tools to this MCP server.
+
+    The existing startup helper suppresses interactive OAuth so no prompt can
+    write to stdin/stdout, which are the MCP protocol wire in this process.
+    """
+    if mode != MCP_MODE_FULL:
+        return
+    if not _env_bool(MCP_DISCOVER_EXTERNAL_ENV, True):
+        logger.info("external MCP discovery disabled by %s", MCP_DISCOVER_EXTERNAL_ENV)
+        return
+
+    try:
+        from hermes_cli.mcp_startup import _discover_mcp_tools_without_interactive_oauth
+
+        _discover_mcp_tools_without_interactive_oauth()
+    except Exception as exc:
+        # Keep the server usable with built-in/plugin tools when one configured
+        # MCP backend is broken. The external discovery layer already applies
+        # its own per-server availability/reconnect behavior where possible.
+        logger.warning("external MCP discovery failed; continuing with available tools: %s", exc)
+
+
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached."""
     try:
@@ -157,11 +204,16 @@ def _build_server() -> Any:
         instructions=(
             "Hermes Agent tool surface exposed over MCP. In curated mode this "
             "contains the Codex-safe Hermes-specific subset. In full mode it "
-            "contains every currently available registry tool, including "
-            "delegate_task, memory, session_search and todo through the MCP "
-            "agent-context bridge."
+            "contains every currently available built-in, plugin and configured "
+            "external MCP registry tool, including delegate_task, memory, "
+            "session_search and todo through the MCP agent-context bridge."
         ),
     )
+
+    # model_tools deliberately does not discover configured MCP servers at
+    # import time. Full mode is a dedicated MCP process with a static tool list,
+    # so discovery must finish before taking the authoritative registry snapshot.
+    _discover_external_mcp_tools(mode)
 
     # Always request the raw pre-Tool-Search catalog. Otherwise progressive
     # disclosure can replace real tools with tool_search/tool_describe/tool_call
