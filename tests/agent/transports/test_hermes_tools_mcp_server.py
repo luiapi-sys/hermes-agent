@@ -6,8 +6,11 @@ import inspect
 
 from agent.transports.hermes_tools_mcp_server import (
     EXPOSED_TOOLS,
+    MCP_DISCOVER_EXTERNAL_ENV,
     MCP_MODE_CURATED,
     MCP_MODE_FULL,
+    _discover_external_mcp_tools,
+    _env_bool,
     _resolve_exposed_tool_names,
     _resolve_mcp_mode,
     _signature_from_schema,
@@ -145,6 +148,7 @@ class TestExposureMode:
             "session_search": {},
             "todo": {},
             "plugin_custom_tool": {},
+            "external_mcp_tool": {},
         }
         assert _resolve_exposed_tool_names(defs, mode="full") == tuple(sorted(defs))
 
@@ -153,6 +157,61 @@ class TestExposureMode:
         assert _resolve_exposed_tool_names(defs, mode="full") == (
             "future_tool_added_later",
         )
+
+
+class TestExternalDiscovery:
+    def test_env_bool_accepts_common_values(self, monkeypatch):
+        monkeypatch.setenv("X_BOOL", "yes")
+        assert _env_bool("X_BOOL", False) is True
+        monkeypatch.setenv("X_BOOL", "OFF")
+        assert _env_bool("X_BOOL", True) is False
+
+    def test_env_bool_invalid_value_uses_default(self, monkeypatch):
+        monkeypatch.setenv("X_BOOL", "maybe")
+        assert _env_bool("X_BOOL", True) is True
+        assert _env_bool("X_BOOL", False) is False
+
+    def test_curated_mode_never_discovers_external_mcp(self, monkeypatch):
+        import hermes_cli.mcp_startup as startup
+
+        calls = []
+        monkeypatch.setattr(
+            startup,
+            "_discover_mcp_tools_without_interactive_oauth",
+            lambda: calls.append("discover"),
+        )
+        monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "1")
+
+        _discover_external_mcp_tools(MCP_MODE_CURATED)
+        assert calls == []
+
+    def test_full_mode_discovers_external_mcp_before_snapshot(self, monkeypatch):
+        import hermes_cli.mcp_startup as startup
+
+        calls = []
+        monkeypatch.setattr(
+            startup,
+            "_discover_mcp_tools_without_interactive_oauth",
+            lambda: calls.append("discover"),
+        )
+        monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "1")
+
+        _discover_external_mcp_tools(MCP_MODE_FULL)
+        assert calls == ["discover"]
+
+    def test_full_mode_can_disable_external_discovery(self, monkeypatch):
+        import hermes_cli.mcp_startup as startup
+
+        calls = []
+        monkeypatch.setattr(
+            startup,
+            "_discover_mcp_tools_without_interactive_oauth",
+            lambda: calls.append("discover"),
+        )
+        monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "0")
+
+        _discover_external_mcp_tools(MCP_MODE_FULL)
+        assert calls == []
 
 
 class TestModuleSurface:
@@ -256,6 +315,7 @@ class TestBuildServer:
         fake_model_tools.handle_function_call = lambda name, args: "ok"
         monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
         monkeypatch.setenv("HERMES_MCP_MODE", "full")
+        monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "0")
 
         server = m._build_server()
 
