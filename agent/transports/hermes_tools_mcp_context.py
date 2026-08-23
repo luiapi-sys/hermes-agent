@@ -1,28 +1,30 @@
 """Context bridge for agent-loop Hermes tools exposed over MCP.
 
-Most Hermes tools are stateless from the MCP adapter's perspective and can be
-routed through ``model_tools.handle_function_call`` directly. Four tools are
-special: ``todo``, ``memory``, ``session_search`` and ``delegate_task``. Their
-registered handlers expect per-agent state that the normal Hermes conversation
-loop injects when it executes them.
+Most Hermes tools can be routed through ``model_tools.handle_function_call``
+directly. Four tools are special: ``todo``, ``memory``, ``session_search`` and
+``delegate_task``. Their registered handlers expect per-agent state that the
+normal Hermes conversation loop injects when it executes them.
 
-The full MCP surface runs outside that loop, so this module supplies the
-smallest equivalent context without changing the normal CLI/gateway runtime:
+Full-mode MCP runs outside that loop, so this module supplies the smallest
+equivalent context while preserving the *same* ``handle_function_call``
+pipeline used by ordinary tools. This matters because that dispatcher owns
+argument coercion, request/execution middleware, plugin approvals, observability
+hooks and result transforms.
 
-* ``todo`` gets a process-local ``TodoStore`` (one stdio MCP process = one
-  client session unless ``HERMES_MCP_SESSION_ID`` is explicitly reused).
-* ``memory`` gets the normal file-backed ``MemoryStore`` loaded from the active
-  Hermes profile.
-* ``session_search`` gets the normal ``SessionDB`` plus an optional current
-  session id from ``HERMES_MCP_SESSION_ID``.
-* ``delegate_task`` gets a lightweight parent-agent adapter carrying the
-  configured model/provider/runtime state. The delegate implementation still
-  constructs real child ``AIAgent`` instances; this adapter only provides the
-  parent attributes that delegation normally inherits.
+Implementation notes:
 
-The bridge deliberately dispatches through the registered tool handlers rather
-than reimplementing tool semantics. This keeps the source of truth in
-``tools/*_tool.py`` and limits the MCP-specific code to context construction.
+* A thread-local, one-shot membership bypass lets the current MCP invocation
+  pass the ``_AGENT_LOOP_TOOLS`` guard inside ``handle_function_call`` without
+  changing normal behavior in other threads or later nested calls.
+* The registered handlers are wrapped once, process-locally, so the active MCP
+  context is added only when the normal registry dispatch reaches that tool.
+  Existing handler kwargs win via ``setdefault``; real child ``AIAgent`` state
+  therefore takes precedence during delegation.
+* ``todo`` gets a process-local ``TodoStore``.
+* ``memory`` gets the normal profile-scoped, file-backed ``MemoryStore``.
+* ``session_search`` gets ``SessionDB`` plus optional ``HERMES_MCP_SESSION_ID``.
+* ``delegate_task`` gets a lightweight parent-runtime adapter; the existing
+  delegation implementation still creates real child ``AIAgent`` instances.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import logging
 import os
 import sys
 import threading
+from contextlib import nullcontext
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -39,13 +42,83 @@ logger = logging.getLogger(__name__)
 AGENT_LOOP_TOOLS = frozenset({"todo", "memory", "session_search", "delegate_task"})
 MCP_SESSION_ENV = "HERMES_MCP_SESSION_ID"
 
+# These hooks are process-local. The MCP server is a dedicated subprocess, so
+# installing them cannot widen tool behavior in the parent Hermes/Codex process.
+_MCP_DISPATCH_LOCAL = threading.local()
+_HOOK_INSTALL_LOCK = threading.Lock()
+
+
+class _AgentLoopToolSetProxy(set):
+    """Set preserving normal membership except for one MCP call's first check."""
+
+    def __contains__(self, item: object) -> bool:
+        counts = getattr(_MCP_DISPATCH_LOCAL, "bypass_once", None)
+        if isinstance(counts, dict):
+            remaining = counts.get(item, 0)
+            if remaining > 0:
+                counts[item] = remaining - 1
+                return False
+        return super().__contains__(item)
+
+
+def _ensure_model_tools_context_hooks() -> None:
+    """Install process-local hooks that keep execution inside model_tools.
+
+    The wrappers are idempotent and intentionally do not alter schemas or tool
+    names. Hooks/middleware therefore continue to observe the canonical Hermes
+    tool name (``memory``, ``delegate_task``, etc.), not an MCP alias.
+    """
+    import model_tools
+    from tools.registry import registry
+
+    with _HOOK_INSTALL_LOCK:
+        current_agent_loop_tools = getattr(model_tools, "_AGENT_LOOP_TOOLS", set())
+        if not isinstance(current_agent_loop_tools, _AgentLoopToolSetProxy):
+            model_tools._AGENT_LOOP_TOOLS = _AgentLoopToolSetProxy(
+                current_agent_loop_tools
+            )
+
+        registry_lock = getattr(registry, "_lock", None)
+        lock_context = registry_lock if registry_lock is not None else nullcontext()
+        with lock_context:
+            for tool_name in AGENT_LOOP_TOOLS:
+                entry = registry.get_entry(tool_name)
+                if entry is None:
+                    continue
+                handler = entry.handler
+                if getattr(handler, "_hermes_mcp_context_wrapper", False):
+                    continue
+
+                def _wrapped_handler(
+                    args: dict,
+                    _original=handler,
+                    _tool_name=tool_name,
+                    **kwargs: Any,
+                ):
+                    active = getattr(_MCP_DISPATCH_LOCAL, "active", None)
+                    if (
+                        isinstance(active, tuple)
+                        and len(active) == 2
+                        and active[0] == _tool_name
+                        and isinstance(active[1], dict)
+                    ):
+                        # Existing kwargs (e.g. a real child AIAgent's
+                        # parent_agent/store) always win over MCP fallback state.
+                        for key, value in active[1].items():
+                            kwargs.setdefault(key, value)
+                    return _original(args, **kwargs)
+
+                _wrapped_handler._hermes_mcp_context_wrapper = True
+                _wrapped_handler._hermes_mcp_original_handler = handler
+                entry.handler = _wrapped_handler
+
 
 class _DelegateParentContext:
     """Minimal parent surface consumed by ``tools.delegate_tool``.
 
     This is not an ``AIAgent`` and never runs its own model loop. It only holds
-    the runtime/session attributes that ``delegate_task`` inherits while
-    constructing real child agents.
+    runtime/session attributes that ``delegate_task`` inherits while building
+    real child agents.
     """
 
     def __init__(self, *, session_db: Any = None, available_tool_names: tuple[str, ...] = ()):
@@ -92,9 +165,8 @@ class _DelegateParentContext:
             "base_url": self.base_url,
         }
 
-        # None means "all toolsets" in the normal Hermes runtime. The
-        # delegate code falls back to valid_tool_names to derive the effective
-        # set, so keep the raw full-MCP catalog here.
+        # None means "all toolsets" in normal Hermes runtime. Delegation falls
+        # back to valid_tool_names to derive the effective set.
         self.enabled_toolsets = None
         self.disabled_toolsets = None
         self.valid_tool_names = set(available_tool_names)
@@ -118,15 +190,17 @@ class _DelegateParentContext:
 
         self._session_db = session_db
         # Do not invent a parent session id. If the MCP host has a real Hermes
-        # session it can provide it explicitly; otherwise children are simply
-        # standalone subagent sessions and avoid an invalid parent FK.
+        # session it can provide it explicitly; otherwise children remain
+        # standalone and avoid an invalid parent-session FK.
         self.session_id = os.environ.get(MCP_SESSION_ENV, "").strip() or None
         self._current_turn_id = ""
+        self._current_task_id = None
         self._delegate_depth = 0
         self._subagent_id = None
         self._delegate_spinner = None
         self.tool_progress_callback = None
         self._print_fn = self._safe_print
+        self._interrupt_requested = False
 
         self._active_children: list[Any] = []
         self._active_children_lock = threading.RLock()
@@ -142,7 +216,7 @@ class _DelegateParentContext:
 
 
 class MCPAgentContextBridge:
-    """Provide missing context for the four Hermes agent-loop tools."""
+    """Provide missing state while preserving model_tools dispatch semantics."""
 
     def __init__(self, *, available_tool_names: tuple[str, ...] = ()) -> None:
         self._lock = threading.RLock()
@@ -196,41 +270,56 @@ class MCPAgentContextBridge:
                 )
             return self._delegate_parent
 
+    def _context_for(self, tool_name: str) -> dict[str, Any]:
+        if tool_name == "todo":
+            return {"store": self._get_todo_store()}
+        if tool_name == "memory":
+            return {"store": self._get_memory_store()}
+        if tool_name == "session_search":
+            return {
+                "db": self._get_session_db(),
+                "current_session_id": (
+                    os.environ.get(MCP_SESSION_ENV, "").strip() or None
+                ),
+            }
+        if tool_name == "delegate_task":
+            # MCP/tool-only channels cannot receive detached subagent
+            # completions. Match hermes -z and force inline/synchronous delivery.
+            from gateway.session_context import declare_stateless_channel
+
+            declare_stateless_channel()
+            return {"parent_agent": self._get_delegate_parent()}
+        raise ValueError(f"{tool_name!r} is not an agent-loop MCP bridge tool")
+
     def dispatch(self, tool_name: str, args: dict[str, Any]) -> str | dict:
-        """Dispatch one agent-loop tool through its registered Hermes handler."""
+        """Execute an agent-loop tool through ``model_tools.handle_function_call``."""
         if tool_name not in AGENT_LOOP_TOOLS:
             raise ValueError(f"{tool_name!r} is not an agent-loop MCP bridge tool")
 
-        from tools.registry import registry
+        _ensure_model_tools_context_hooks()
+        context = self._context_for(tool_name)
+        session_id = os.environ.get(MCP_SESSION_ENV, "").strip() or None
 
-        if tool_name == "todo":
-            # TodoStore is intentionally mutable process-local state; serialize
-            # calls so parallel MCP requests cannot interleave writes.
-            with self._lock:
-                return registry.dispatch(tool_name, args, store=self._get_todo_store())
+        previous_active = getattr(_MCP_DISPATCH_LOCAL, "active", None)
+        previous_counts = dict(
+            getattr(_MCP_DISPATCH_LOCAL, "bypass_once", {}) or {}
+        )
+        next_counts = dict(previous_counts)
+        next_counts[tool_name] = next_counts.get(tool_name, 0) + 1
+        _MCP_DISPATCH_LOCAL.active = (tool_name, context)
+        _MCP_DISPATCH_LOCAL.bypass_once = next_counts
 
-        if tool_name == "memory":
-            return registry.dispatch(tool_name, args, store=self._get_memory_store())
+        try:
+            from model_tools import handle_function_call
 
-        if tool_name == "session_search":
-            return registry.dispatch(
+            return handle_function_call(
                 tool_name,
                 args,
-                db=self._get_session_db(),
-                current_session_id=os.environ.get(MCP_SESSION_ENV, "").strip() or None,
+                session_id=session_id,
             )
-
-        # Remote/tool-only MCP channels cannot receive detached subagent
-        # completion events. Mark this process as stateless so delegate_task
-        # follows its synchronous/inline delivery path, exactly like hermes -z.
-        from gateway.session_context import declare_stateless_channel
-
-        declare_stateless_channel()
-        return registry.dispatch(
-            tool_name,
-            args,
-            parent_agent=self._get_delegate_parent(),
-        )
+        finally:
+            _MCP_DISPATCH_LOCAL.active = previous_active
+            _MCP_DISPATCH_LOCAL.bypass_once = previous_counts
 
     def close(self) -> None:
         with self._lock:
