@@ -23,12 +23,13 @@ User-facing behavior is configured in ``config.yaml`` under
     including configured external MCP tools and the stateful agent-loop tools
     supported by the MCP context bridge.
 
-For security, full mode does *not* expose Hermes' native shell/file/process
-surface, ``delegate_task`` or ``cronjob`` by default. Those capabilities can
-execute outside a coding client's own sandbox/approval boundary, directly or
-through spawned agents. A trusted external MCP deployment (for example a
-dedicated ChatGPT remote MCP gateway) that intentionally wants the complete
-native surface must also set ``mcp.hermes_tools.allow_native_execution: true``.
+For security, full mode filters registry tools carrying host-execution,
+filesystem, process-control, UI-automation, agent-spawn, or worker-spawn
+capabilities by default. Classification lives in the central tool registry so
+future tools inherit the boundary from their toolset or explicit metadata. A
+trusted external MCP deployment (for example a dedicated ChatGPT remote MCP
+gateway) that intentionally wants the complete native surface must also set
+``mcp.hermes_tools.allow_native_execution: true``.
 
 ``HERMES_MCP_MODE``, ``HERMES_MCP_DISCOVER_EXTERNAL`` and
 ``HERMES_MCP_ALLOW_NATIVE_EXECUTION`` remain supported as process-local/internal
@@ -46,7 +47,9 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Collection, Mapping, Optional
+
+from tools.registry import ToolCapability, registry
 
 logger = logging.getLogger(__name__)
 
@@ -57,21 +60,16 @@ MCP_MODE_CURATED = "curated"
 MCP_MODE_FULL = "full"
 _VALID_MCP_MODES = {MCP_MODE_CURATED, MCP_MODE_FULL}
 
-# Native Hermes tools that can bypass a coding client's own sandbox / approval
-# layer. delegate_task and cronjob are also gated because they can spawn agents
-# with native execution toolsets and would otherwise provide indirect bypasses.
-_NATIVE_BOUNDARY_TOOLS: frozenset[str] = frozenset(
+# Security capabilities that can escape a coding client's own sandbox or
+# approval boundary. The registry, not this transport, owns tool classification.
+_MCP_UNSAFE_CAPABILITIES: frozenset[str] = frozenset(
     {
-        "terminal",
-        "shell",
-        "read_file",
-        "write_file",
-        "patch",
-        "search_files",
-        "process",
-        "execute_code",
-        "delegate_task",
-        "cronjob",
+        ToolCapability.HOST_EXECUTION,
+        ToolCapability.FILESYSTEM_ACCESS,
+        ToolCapability.PROCESS_CONTROL,
+        ToolCapability.UI_AUTOMATION,
+        ToolCapability.SPAWN_AGENT,
+        ToolCapability.SPAWN_WORKER,
     }
 )
 
@@ -260,19 +258,27 @@ def _resolve_exposed_tool_names(
     *,
     mode: str | None = None,
     allow_native_execution: bool = True,
+    capabilities_by_name: Mapping[str, Collection[str]] | None = None,
 ) -> tuple[str, ...]:
-    """Return tool names exposed by the selected MCP policy.
+    """Return tool names exposed by the selected MCP capability policy.
 
-    The internal helper preserves its historical direct-call behavior by
-    defaulting ``allow_native_execution`` to true. Production startup always
-    passes the explicitly resolved policy value from config.
+    ``all_defs`` remains the authoritative availability snapshot. In safe full
+    mode, tools carrying any security-sensitive registry capability are removed
+    regardless of their concrete name. Production startup passes a capability
+    snapshot from the same registry generation used to build ``all_defs``.
     """
     resolved_mode = _resolve_mcp_mode(mode)
     if resolved_mode == MCP_MODE_FULL:
-        names = set(all_defs)
-        if not allow_native_execution:
-            names.difference_update(_NATIVE_BOUNDARY_TOOLS)
-        return tuple(sorted(names))
+        if allow_native_execution:
+            return tuple(sorted(all_defs))
+        caps = capabilities_by_name or {}
+        return tuple(
+            sorted(
+                name
+                for name in all_defs
+                if not (_MCP_UNSAFE_CAPABILITIES & frozenset(caps.get(name, ())))
+            )
+        )
     return EXPOSED_TOOLS
 
 
@@ -333,9 +339,9 @@ def _build_server() -> Any:
             "the Codex-safe Hermes-specific subset. Full mode contains every "
             "currently available built-in, plugin and configured external MCP "
             "registry tool allowed by the MCP policy. Stateful agent-loop tools "
-            "are supported through the MCP context bridge. Native shell/file/process "
-            "tools, delegate_task and cronjob are included only when "
-            "allow_native_execution is explicitly enabled."
+            "are supported through the MCP context bridge. Tools carrying native "
+            "execution, filesystem, process, UI-automation, or spawn capabilities "
+            "are included only when allow_native_execution is explicitly enabled."
         ),
     )
 
@@ -364,10 +370,15 @@ def _build_server() -> Any:
         )
     }
 
+    capabilities_by_name = {
+        name: registry.get_tool_capabilities(name)
+        for name in all_defs
+    }
     tool_names = _resolve_exposed_tool_names(
         all_defs,
         mode=mode,
         allow_native_execution=allow_native_execution,
+        capabilities_by_name=capabilities_by_name,
     )
 
     # Only full mode needs the stateful bridge. Curated mode keeps the exact

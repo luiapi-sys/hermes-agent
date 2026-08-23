@@ -7,13 +7,22 @@ from agent.transports.hermes_tools_mcp_server import (
     MCP_DISCOVER_EXTERNAL_ENV,
     MCP_MODE_CURATED,
     MCP_MODE_FULL,
-    _NATIVE_BOUNDARY_TOOLS,
+    _MCP_UNSAFE_CAPABILITIES,
     _load_hermes_tools_config,
     _resolve_allow_native_execution,
     _resolve_discover_external,
     _resolve_exposed_tool_names,
     _resolve_mcp_mode,
 )
+from tools.registry import ToolCapability, ToolRegistry
+
+
+def _schema(name: str) -> dict:
+    return {
+        "name": name,
+        "description": name,
+        "parameters": {"type": "object", "properties": {}},
+    }
 
 
 def test_profile_config_is_primary_user_facing_source(monkeypatch):
@@ -72,60 +81,114 @@ def test_legacy_process_override_remains_supported(monkeypatch):
     assert _resolve_allow_native_execution(config=cfg) is True
 
 
-def test_cronjob_is_part_of_native_execution_boundary():
-    assert "cronjob" in _NATIVE_BOUNDARY_TOOLS
+def test_registry_toolset_defaults_classify_native_execution_surfaces():
+    reg = ToolRegistry()
+    cases = (
+        ("terminal", "terminal", ToolCapability.HOST_EXECUTION),
+        ("read_file", "file", ToolCapability.FILESYSTEM_ACCESS),
+        ("execute_code", "code_execution", ToolCapability.HOST_EXECUTION),
+        ("computer_use", "computer_use", ToolCapability.UI_AUTOMATION),
+        ("delegate_task", "delegation", ToolCapability.SPAWN_AGENT),
+        ("cronjob", "cronjob", ToolCapability.SPAWN_AGENT),
+    )
+    for name, toolset, expected in cases:
+        reg.register(
+            name=name,
+            toolset=toolset,
+            schema=_schema(name),
+            handler=lambda args, **kw: "",
+        )
+        assert expected in reg.get_tool_capabilities(name)
 
 
-def test_full_mode_protects_native_boundary_without_explicit_opt_in():
+def test_explicit_capabilities_union_with_toolset_defaults():
+    reg = ToolRegistry()
+    reg.register(
+        name="future_terminal_worker",
+        toolset="terminal",
+        schema=_schema("future_terminal_worker"),
+        handler=lambda args, **kw: "",
+        capabilities={ToolCapability.SPAWN_WORKER},
+    )
+    caps = reg.get_tool_capabilities("future_terminal_worker")
+    assert ToolCapability.HOST_EXECUTION in caps
+    assert ToolCapability.PROCESS_CONTROL in caps
+    assert ToolCapability.SPAWN_WORKER in caps
+
+
+def test_safe_full_filters_by_capability_not_concrete_tool_name():
     defs = {
-        "terminal": {},
-        "read_file": {},
-        "write_file": {},
-        "patch": {},
-        "search_files": {},
-        "process": {},
-        "execute_code": {},
+        "future_ui_tool": {},
+        "future_worker_tool": {},
         "memory": {},
-        "session_search": {},
-        "todo": {},
-        "delegate_task": {},
-        "cronjob": {},
         "external_mcp_tool": {},
     }
-
+    caps = {
+        "future_ui_tool": {ToolCapability.UI_AUTOMATION},
+        "future_worker_tool": {ToolCapability.SPAWN_WORKER},
+        "memory": set(),
+        "external_mcp_tool": set(),
+    }
     exposed = set(
         _resolve_exposed_tool_names(
             defs,
             mode="full",
             allow_native_execution=False,
+            capabilities_by_name=caps,
         )
     )
-    assert not (exposed & _NATIVE_BOUNDARY_TOOLS)
-    assert "delegate_task" not in exposed
-    assert "cronjob" not in exposed
-    assert {"memory", "session_search", "todo", "external_mcp_tool"} <= exposed
+    assert "future_ui_tool" not in exposed
+    assert "future_worker_tool" not in exposed
+    assert {"memory", "external_mcp_tool"} <= exposed
 
 
-def test_trusted_external_gateway_can_explicitly_enable_complete_surface():
-    defs = {
-        "terminal": {},
-        "read_file": {},
-        "write_file": {},
-        "patch": {},
-        "process": {},
-        "execute_code": {},
-        "memory": {},
-        "session_search": {},
-        "todo": {},
-        "delegate_task": {},
-        "cronjob": {},
-        "external_mcp_tool": {},
+def test_trusted_full_includes_capability_marked_tools():
+    defs = {"terminal": {}, "computer_use": {}, "kanban_create": {}, "memory": {}}
+    caps = {
+        "terminal": {ToolCapability.HOST_EXECUTION},
+        "computer_use": {ToolCapability.UI_AUTOMATION},
+        "kanban_create": {ToolCapability.SPAWN_WORKER},
+        "memory": set(),
     }
-
     assert set(
         _resolve_exposed_tool_names(
             defs,
             mode="full",
             allow_native_execution=True,
+            capabilities_by_name=caps,
         )
     ) == set(defs)
+
+
+def test_unsafe_capability_set_covers_execution_and_spawn_classes():
+    assert {
+        ToolCapability.HOST_EXECUTION,
+        ToolCapability.FILESYSTEM_ACCESS,
+        ToolCapability.PROCESS_CONTROL,
+        ToolCapability.UI_AUTOMATION,
+        ToolCapability.SPAWN_AGENT,
+        ToolCapability.SPAWN_WORKER,
+    } <= _MCP_UNSAFE_CAPABILITIES
+
+
+def test_registered_escape_surfaces_are_classified():
+    import model_tools  # noqa: F401 - triggers built-in tool discovery
+    from tools.registry import registry
+
+    expected = {
+        "terminal": ToolCapability.HOST_EXECUTION,
+        "process": ToolCapability.PROCESS_CONTROL,
+        "read_file": ToolCapability.FILESYSTEM_ACCESS,
+        "write_file": ToolCapability.FILESYSTEM_ACCESS,
+        "patch": ToolCapability.FILESYSTEM_ACCESS,
+        "search_files": ToolCapability.FILESYSTEM_ACCESS,
+        "execute_code": ToolCapability.HOST_EXECUTION,
+        "computer_use": ToolCapability.UI_AUTOMATION,
+        "delegate_task": ToolCapability.SPAWN_AGENT,
+        "cronjob": ToolCapability.SPAWN_AGENT,
+        "kanban_create": ToolCapability.SPAWN_WORKER,
+        "kanban_unblock": ToolCapability.SPAWN_WORKER,
+        "kanban_complete": ToolCapability.SPAWN_WORKER,
+    }
+    for name, capability in expected.items():
+        assert capability in registry.get_tool_capabilities(name), name
