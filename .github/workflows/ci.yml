@@ -71,12 +71,11 @@ jobs:
           mkdir -p "$HERMES_HOME"
           rm -f "$SMOKE_EXTERNAL_MARKER"
 
-          cat > "$RUNNER_TEMP/ext_mcp.py" <<'PY'
-          import os
+          cat > "$RUNNER_TEMP/ext_mcp.py" <<PY
           from pathlib import Path
           from mcp.server.fastmcp import FastMCP
 
-          Path(os.environ["SMOKE_EXTERNAL_MARKER"]).write_text("started")
+          Path(r"$SMOKE_EXTERNAL_MARKER").write_text("started")
           mcp = FastMCP("policy-smoke-external")
 
           @mcp.tool()
