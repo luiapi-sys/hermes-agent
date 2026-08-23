@@ -42,6 +42,7 @@ class ToolCapability:
     SPAWN_AGENT = "spawn_agent"
     SPAWN_WORKER = "spawn_worker"
     EXTERNAL_MCP = "external_mcp"
+    EXTERNAL_SIDE_EFFECT = "external_side_effect"
 
 
 _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
@@ -53,6 +54,31 @@ _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
     "computer_use": frozenset(
         {ToolCapability.UI_AUTOMATION, ToolCapability.HOST_EXECUTION}
     ),
+    # Browser commands can launch/control local Chromium or a helper CLI.
+    "browser": frozenset(
+        {
+            ToolCapability.UI_AUTOMATION,
+            ToolCapability.HOST_EXECUTION,
+            ToolCapability.PROCESS_CONTROL,
+        }
+    ),
+    # TTS can write arbitrary output paths and providers may launch ffmpeg,
+    # local engines, or user-configured command providers.
+    "tts": frozenset(
+        {
+            ToolCapability.FILESYSTEM_ACCESS,
+            ToolCapability.HOST_EXECUTION,
+            ToolCapability.PROCESS_CONTROL,
+        }
+    ),
+    # Remote integration toolsets are fail-closed as a unit. Some of them
+    # multiplex reads and writes behind one schema/action enum, so trying to
+    # infer safety per call during static MCP registration is not sound.
+    "discord": frozenset({ToolCapability.EXTERNAL_SIDE_EFFECT}),
+    "discord_admin": frozenset({ToolCapability.EXTERNAL_SIDE_EFFECT}),
+    "homeassistant": frozenset({ToolCapability.EXTERNAL_SIDE_EFFECT}),
+    "feishu_drive": frozenset({ToolCapability.EXTERNAL_SIDE_EFFECT}),
+    "hermes-yuanbao": frozenset({ToolCapability.EXTERNAL_SIDE_EFFECT}),
     "delegation": frozenset({ToolCapability.SPAWN_AGENT}),
     "cronjob": frozenset({ToolCapability.SPAWN_AGENT}),
 }
@@ -570,11 +596,18 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
+    def get_definitions(
+        self,
+        tool_names: Set[str],
+        quiet: bool = False,
+        excluded_capabilities: Set[str] | None = None,
+    ) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
-        Only tools whose ``check_fn()`` returns True (or have no check_fn)
-        are included. ``check_fn()`` results are cached for ~30 s via
+        Tools carrying an ``excluded_capabilities`` value are removed before
+        their ``check_fn`` is evaluated. Remaining tools are included only
+        when ``check_fn()`` returns True (or have no check_fn). ``check_fn()``
+        results are cached for ~30 s via
         :func:`_check_fn_cached` to amortize repeat probes (check_terminal_
         requirements probes modal/docker, browser checks probe playwright,
         etc.); TTL chosen so env-var changes (``hermes tools enable foo``)
@@ -582,6 +615,7 @@ class ToolRegistry:
         flush on every call.
         """
         result = []
+        excluded = frozenset(excluded_capabilities or ())
         # Per-call cache on top of the 30 s TTL — handles repeat probes of the
         # same check_fn within one definitions pass without re-reading the
         # TTL clock.
@@ -590,6 +624,17 @@ class ToolRegistry:
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:
+                continue
+            # Security policy is evaluated before check_fn. Availability
+            # probes are executable code and may spawn subprocesses or touch
+            # external services, so a denied capability must never be probed.
+            if excluded and entry.capabilities & excluded:
+                if not quiet:
+                    logger.debug(
+                        "Tool %s excluded by capability policy: %s",
+                        name,
+                        ", ".join(sorted(entry.capabilities & excluded)),
+                    )
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
