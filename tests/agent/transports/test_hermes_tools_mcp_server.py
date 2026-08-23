@@ -1,26 +1,24 @@
-"""Tests for the hermes-tools-as-MCP server module surface.
-
-We don't run a live MCP session in unit tests — that requires the codex
-subprocess + client + an event loop. These tests pin the static
-contract: the module imports, the EXPOSED_TOOLS list is sane, and the
-build helper assembles a server when the SDK is present.
-"""
+"""Tests for the hermes-tools-as-MCP server module surface."""
 
 from __future__ import annotations
 
 import inspect
-from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
+    EXPOSED_TOOLS,
+    MCP_DISCOVER_EXTERNAL_ENV,
+    MCP_MODE_CURATED,
+    MCP_MODE_FULL,
+    _discover_external_mcp_tools,
+    _env_bool,
+    _resolve_exposed_tool_names,
+    _resolve_mcp_mode,
     _signature_from_schema,
 )
 
 
 class TestSignatureFromSchema:
-    """Test the JSON Schema -> Python signature conversion."""
-
     def test_simple_required_string_param(self):
-        """A required string param becomes str with no default."""
         schema = {
             "type": "object",
             "properties": {"query": {"type": "string"}},
@@ -36,19 +34,14 @@ class TestSignatureFromSchema:
         assert param.default is inspect.Parameter.empty
 
     def test_optional_integer_param(self):
-        """An optional param gets Optional[type] with default=None."""
         schema = {
             "type": "object",
             "properties": {"limit": {"type": "integer"}},
         }
-        sig, annots = _signature_from_schema(schema)
-
-        param = sig.parameters["limit"]
-        # Optional[type] is type | None in Python 3.10+
-        assert param.default is None
+        sig, _ = _signature_from_schema(schema)
+        assert sig.parameters["limit"].default is None
 
     def test_multiple_params_mixed_required_optional(self):
-        """Mixed required and optional params are handled correctly."""
         schema = {
             "type": "object",
             "properties": {
@@ -61,19 +54,12 @@ class TestSignatureFromSchema:
         sig, annots = _signature_from_schema(schema)
 
         assert len(sig.parameters) == 3
-
-        # query: required str
         assert annots["query"] == str
         assert sig.parameters["query"].default is inspect.Parameter.empty
-
-        # limit: optional int
         assert sig.parameters["limit"].default is None
-
-        # offset: optional int
         assert sig.parameters["offset"].default is None
 
     def test_skip_private_params(self):
-        """Params starting with '_' are excluded from the signature."""
         schema = {
             "type": "object",
             "properties": {
@@ -89,7 +75,6 @@ class TestSignatureFromSchema:
         assert "query" in sig.parameters
 
     def test_all_json_types(self):
-        """All JSON schema types map to correct Python types."""
         schema = {
             "type": "object",
             "properties": {
@@ -102,7 +87,7 @@ class TestSignatureFromSchema:
             },
             "required": ["s", "i", "n", "b", "a", "o"],
         }
-        sig, annots = _signature_from_schema(schema)
+        _, annots = _signature_from_schema(schema)
 
         assert annots["s"] == str
         assert annots["i"] == int
@@ -112,53 +97,146 @@ class TestSignatureFromSchema:
         assert annots["o"] == dict
 
     def test_empty_schema(self):
-        """Empty schema returns empty signature."""
         sig, annots = _signature_from_schema(None)
         assert len(sig.parameters) == 0
         assert len(annots) == 0
 
     def test_return_annotation_is_str(self):
-        """All generated signatures have str as return type."""
         schema = {
             "type": "object",
             "properties": {"query": {"type": "string"}},
         }
-        sig, annots = _signature_from_schema(schema)
+        sig, _ = _signature_from_schema(schema)
         assert sig.return_annotation == str
 
 
+class TestExposureMode:
+    def test_default_mode_is_curated(self, monkeypatch):
+        monkeypatch.delenv("HERMES_MCP_MODE", raising=False)
+        assert _resolve_mcp_mode() == MCP_MODE_CURATED
+
+    def test_full_mode_from_environment(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MCP_MODE", "full")
+        assert _resolve_mcp_mode() == MCP_MODE_FULL
+
+    def test_mode_is_case_and_whitespace_tolerant(self):
+        assert _resolve_mcp_mode("  FULL  ") == MCP_MODE_FULL
+        assert _resolve_mcp_mode(" Curated ") == MCP_MODE_CURATED
+
+    def test_invalid_mode_fails_closed_to_curated(self):
+        assert _resolve_mcp_mode("everything") == MCP_MODE_CURATED
+
+    def test_curated_mode_uses_historical_allowlist(self):
+        defs = {
+            "web_search": {},
+            "terminal": {},
+            "delegate_task": {},
+        }
+        assert _resolve_exposed_tool_names(defs, mode="curated") == EXPOSED_TOOLS
+
+    def test_full_mode_exposes_all_available_registry_tools(self):
+        defs = {
+            "web_search": {},
+            "terminal": {},
+            "read_file": {},
+            "write_file": {},
+            "patch": {},
+            "process": {},
+            "execute_code": {},
+            "delegate_task": {},
+            "memory": {},
+            "session_search": {},
+            "todo": {},
+            "plugin_custom_tool": {},
+            "external_mcp_tool": {},
+        }
+        assert _resolve_exposed_tool_names(defs, mode="full") == tuple(sorted(defs))
+
+    def test_full_mode_is_dynamic_not_hardcoded(self):
+        defs = {"future_tool_added_later": {}}
+        assert _resolve_exposed_tool_names(defs, mode="full") == (
+            "future_tool_added_later",
+        )
 
 
+class TestExternalDiscovery:
+    def test_env_bool_accepts_common_values(self, monkeypatch):
+        monkeypatch.setenv("X_BOOL", "yes")
+        assert _env_bool("X_BOOL", False) is True
+        monkeypatch.setenv("X_BOOL", "OFF")
+        assert _env_bool("X_BOOL", True) is False
+
+    def test_env_bool_invalid_value_uses_default(self, monkeypatch):
+        monkeypatch.setenv("X_BOOL", "maybe")
+        assert _env_bool("X_BOOL", True) is True
+        assert _env_bool("X_BOOL", False) is False
+
+    def test_curated_mode_never_discovers_external_mcp(self, monkeypatch):
+        import hermes_cli.mcp_startup as startup
+
+        calls = []
+        monkeypatch.setattr(
+            startup,
+            "_discover_mcp_tools_without_interactive_oauth",
+            lambda: calls.append("discover"),
+        )
+        monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "1")
+
+        _discover_external_mcp_tools(MCP_MODE_CURATED)
+        assert calls == []
+
+    def test_full_mode_discovers_external_mcp_before_snapshot(self, monkeypatch):
+        import hermes_cli.mcp_startup as startup
+
+        calls = []
+        monkeypatch.setattr(
+            startup,
+            "_discover_mcp_tools_without_interactive_oauth",
+            lambda: calls.append("discover"),
+        )
+        monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "1")
+
+        _discover_external_mcp_tools(MCP_MODE_FULL)
+        assert calls == ["discover"]
+
+    def test_full_mode_can_disable_external_discovery(self, monkeypatch):
+        import hermes_cli.mcp_startup as startup
+
+        calls = []
+        monkeypatch.setattr(
+            startup,
+            "_discover_mcp_tools_without_interactive_oauth",
+            lambda: calls.append("discover"),
+        )
+        monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "0")
+
+        _discover_external_mcp_tools(MCP_MODE_FULL)
+        assert calls == []
 
 
 class TestModuleSurface:
     def test_module_imports_clean(self):
         from agent.transports import hermes_tools_mcp_server as m
+
         assert callable(m.main)
         assert callable(m._build_server)
         assert isinstance(m.EXPOSED_TOOLS, tuple)
         assert len(m.EXPOSED_TOOLS) > 0
 
-    def test_exposed_tools_are_safe_subset(self):
-        """We MUST NOT expose tools codex already has, because codex'
-        own builtins are better-integrated with its sandbox + approvals.
-        Specifically: no terminal/shell, no read_file/write_file, no
-        patch — those are codex's built-in tools."""
-        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+    def test_curated_tools_are_safe_subset(self):
         forbidden = {
-            "terminal", "shell", "read_file", "write_file", "patch",
-            "search_files", "process",
+            "terminal",
+            "shell",
+            "read_file",
+            "write_file",
+            "patch",
+            "search_files",
+            "process",
         }
         leaked = forbidden & set(EXPOSED_TOOLS)
-        assert not leaked, (
-            f"these tools must NOT be exposed via the codex callback "
-            f"because codex has built-in equivalents: {leaked}"
-        )
+        assert not leaked
 
     def test_expected_hermes_specific_tools_listed(self):
-        """The Hermes-specific tools should be present so users on the
-        codex runtime keep access to them."""
-        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
         for required in (
             "web_search",
             "web_extract",
@@ -167,44 +245,27 @@ class TestModuleSurface:
             "image_generate",
             "skill_view",
         ):
-            assert required in EXPOSED_TOOLS, f"missing {required!r}"
+            assert required in EXPOSED_TOOLS
 
-    def test_agent_loop_tools_not_exposed(self):
-        """delegate_task / memory / session_search / todo require the
-        running AIAgent context to dispatch, so a stateless MCP callback
-        can't drive them. They must NOT be in EXPOSED_TOOLS."""
-        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
-        for agent_loop_tool in ("delegate_task", "memory", "session_search", "todo"):
-            assert agent_loop_tool not in EXPOSED_TOOLS, (
-                f"{agent_loop_tool!r} requires the agent loop context "
-                "and can't be reached through a stateless MCP callback"
-            )
+    def test_agent_loop_tools_not_in_curated_allowlist(self):
+        for agent_loop_tool in (
+            "delegate_task",
+            "memory",
+            "session_search",
+            "todo",
+        ):
+            assert agent_loop_tool not in EXPOSED_TOOLS
 
-    def test_kanban_worker_tools_exposed(self):
-        """Kanban workers run as `hermes chat -q` subprocesses; if they
-        come up on the codex_app_server runtime, the worker can do the
-        actual work via codex's shell but needs the kanban tools through
-        the MCP callback to report back to the kernel. Without these
-        tools available, the worker would hang at completion time."""
-        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
-        # Worker handoff tools — every dispatched worker uses at least
-        # one of {complete, block, comment} to close out its task.
+    def test_kanban_worker_tools_exposed_in_curated_mode(self):
         for worker_tool in (
             "kanban_complete",
             "kanban_block",
             "kanban_comment",
             "kanban_heartbeat",
         ):
-            assert worker_tool in EXPOSED_TOOLS, (
-                f"{worker_tool!r} missing from codex callback — kanban "
-                "workers on codex_app_server runtime would hang"
-            )
+            assert worker_tool in EXPOSED_TOOLS
 
-    def test_kanban_orchestrator_tools_exposed(self):
-        """Orchestrator agents need to dispatch new tasks, query the
-        board, and unblock/link tasks. Exposed so an orchestrator on
-        codex_app_server can do its job."""
-        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+    def test_kanban_orchestrator_tools_exposed_in_curated_mode(self):
         for orch_tool in (
             "kanban_create",
             "kanban_show",
@@ -212,15 +273,63 @@ class TestModuleSurface:
             "kanban_unblock",
             "kanban_link",
         ):
-            assert orch_tool in EXPOSED_TOOLS, (
-                f"{orch_tool!r} missing from codex callback"
-            )
+            assert orch_tool in EXPOSED_TOOLS
+
+
+class TestBuildServer:
+    def test_build_requests_raw_pre_tool_search_catalog(self, monkeypatch):
+        """Full exposure must not be collapsed by progressive Tool Search."""
+        import sys
+        import types
+        import agent.transports.hermes_tools_mcp_server as m
+
+        calls = []
+
+        class FakeFastMCP:
+            def __init__(self, *args, **kwargs):
+                self.tools = []
+
+            def add_tool(self, handler, *, name, description):
+                self.tools.append(name)
+
+        fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+        fake_fastmcp.FastMCP = FakeFastMCP
+        monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
+
+        fake_model_tools = types.ModuleType("model_tools")
+
+        def fake_get_tool_definitions(**kwargs):
+            calls.append(kwargs)
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "description": "terminal",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+
+        fake_model_tools.get_tool_definitions = fake_get_tool_definitions
+        fake_model_tools.handle_function_call = lambda name, args: "ok"
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+        monkeypatch.setenv("HERMES_MCP_MODE", "full")
+        monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "0")
+
+        server = m._build_server()
+
+        assert server.tools == ["terminal"]
+        assert calls == [
+            {
+                "quiet_mode": True,
+                "skip_tool_search_assembly": True,
+            }
+        ]
 
 
 class TestMain:
     def test_main_returns_2_when_mcp_unavailable(self, monkeypatch):
-        """When the mcp package isn't installed, main() should exit
-        cleanly with code 2 and an install hint, not crash."""
         import agent.transports.hermes_tools_mcp_server as m
 
         def boom_build(*a, **kw):
