@@ -316,6 +316,7 @@ class TestBuildServer:
         monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
         monkeypatch.setenv("HERMES_MCP_MODE", "full")
         monkeypatch.setenv(MCP_DISCOVER_EXTERNAL_ENV, "0")
+        monkeypatch.setenv("HERMES_MCP_ALLOW_NATIVE_EXECUTION", "1")
 
         server = m._build_server()
 
