@@ -71,6 +71,7 @@ _MCP_UNSAFE_CAPABILITIES: frozenset[str] = frozenset(
         ToolCapability.SPAWN_AGENT,
         ToolCapability.SPAWN_WORKER,
         ToolCapability.EXTERNAL_MCP,
+        ToolCapability.EXTERNAL_SIDE_EFFECT,
     }
 )
 
@@ -324,6 +325,31 @@ def _discover_external_mcp_tools(
         logger.warning("external MCP discovery failed; continuing with available tools: %s", exc)
 
 
+def _load_model_tool_api(*, suppress_plugin_discovery: bool):
+    """Import model_tools only after the MCP policy is known.
+
+    Safe-full temporarily sets the narrow model_tools import guard so plugin
+    discovery cannot execute user/project/pip plugin code before capability
+    filtering. The environment is restored immediately after import; the module
+    remains cached with plugin discovery skipped for this dedicated process.
+    """
+    key = "HERMES_SKIP_PLUGIN_DISCOVERY"
+    previous = os.environ.get(key)
+    if suppress_plugin_discovery:
+        os.environ[key] = "1"
+    try:
+        import importlib
+
+        model_tools = importlib.import_module("model_tools")
+        return model_tools.get_tool_definitions, model_tools.handle_function_call
+    finally:
+        if suppress_plugin_discovery:
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached."""
     try:
@@ -333,12 +359,18 @@ def _build_server() -> Any:
             f"hermes-tools MCP server requires the 'mcp' package: {exc}"
         ) from exc
 
-    from model_tools import get_tool_definitions, handle_function_call
-
     mcp_config = _load_hermes_tools_config()
     mode = _resolve_mcp_mode(config=mcp_config)
     discover_external = _resolve_discover_external(config=mcp_config)
     allow_native_execution = _resolve_allow_native_execution(config=mcp_config)
+    safe_full = mode == MCP_MODE_FULL and not allow_native_execution
+
+    # Critical ordering: policy is resolved before model_tools import. In
+    # safe-full, plugin discovery is suppressed during that import so plugin
+    # executable code cannot run before the transport boundary exists.
+    get_tool_definitions, handle_function_call = _load_model_tool_api(
+        suppress_plugin_discovery=safe_full,
+    )
 
     mcp = FastMCP(
         "hermes-tools",
@@ -348,8 +380,9 @@ def _build_server() -> Any:
             "currently available built-in, plugin and configured external MCP "
             "registry tool allowed by the MCP policy. Stateful agent-loop tools "
             "are supported through the MCP context bridge. Tools carrying native "
-            "execution, filesystem, process, UI-automation, or spawn capabilities "
-            "are included only when allow_native_execution is explicitly enabled."
+            "execution, filesystem, process, UI-automation, spawn, external-MCP, "
+            "or remote-side-effect capabilities are included only when "
+            "allow_native_execution is explicitly enabled."
         ),
     )
 
@@ -368,9 +401,17 @@ def _build_server() -> Any:
     all_defs = {
         td["function"]["name"]: td["function"]
         for td in (
-            get_tool_definitions(
-                quiet_mode=True,
-                skip_tool_search_assembly=True,
+            (
+                get_tool_definitions(
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                    excluded_capabilities=_MCP_UNSAFE_CAPABILITIES,
+                )
+                if safe_full
+                else get_tool_definitions(
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
             )
             or []
         )

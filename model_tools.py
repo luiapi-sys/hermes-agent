@@ -194,6 +194,18 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
+def _plugin_discovery_enabled() -> bool:
+    """Return False only for the dedicated fail-closed MCP import path.
+
+    This environment switch is intentionally narrow: normal CLI/gateway/ACP
+    processes keep historical plugin discovery. The MCP transport sets it
+    only while importing ``model_tools`` for safe-full mode so user/project/
+    pip plugin code cannot execute before the transport policy is established.
+    """
+    raw = os.environ.get("HERMES_SKIP_PLUGIN_DISCOVERY", "")
+    return str(raw).strip().lower() not in {"1", "true", "yes", "on"}
+
+
 discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
@@ -209,12 +221,17 @@ discover_builtin_tools()
 #   - tui_gateway/server.py     -> inline on startup (no event loop)
 #   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
-# Plugin tool discovery (user/project/pip plugins)
-try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+# Plugin tool discovery (user/project/pip plugins). Safe-full MCP imports
+# this module with HERMES_SKIP_PLUGIN_DISCOVERY=1 so arbitrary plugin code
+# cannot execute before the MCP capability policy is applied.
+if _plugin_discovery_enabled():
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
+else:
+    logger.info("Plugin discovery suppressed by MCP safe-full import policy")
 
 
 # =============================================================================
@@ -290,6 +307,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    excluded_capabilities=None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -305,6 +323,9 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        excluded_capabilities: Security capability classes to remove before
+            registry availability probes execute. Intended for transports
+            that must establish a fail-closed boundary before check_fn code.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -332,6 +353,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            frozenset(excluded_capabilities or ()),
             _is_delegated_child_context(),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -344,8 +366,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        excluded_capabilities=excluded_capabilities,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -369,6 +396,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    excluded_capabilities=None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -456,7 +484,11 @@ def _compute_tool_definitions(
     # other toolset.
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
-    filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    filtered_tools = registry.get_definitions(
+        tools_to_include,
+        quiet=quiet_mode,
+        excluded_capabilities=excluded_capabilities,
+    )
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references

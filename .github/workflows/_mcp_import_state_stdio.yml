@@ -1,0 +1,189 @@
+name: MCP Import-State and Stdio Sentinel
+
+on:
+  pull_request:
+    types: [synchronize, reopened]
+    branches:
+      - fix/mcp-full-policy-hardening
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  validate:
+    if: >-
+      github.head_ref == 'fix/mcp-preexecution-boundary' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Apply import-state guard patch
+        run: python scripts/_apply_mcp_import_state_guard.py
+
+      - name: Install dev dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run focused boundary tests
+        run: >-
+          uv run pytest -q
+          tests/agent/transports/test_mcp_preexecution_boundary.py
+          tests/agent/transports/test_hermes_tools_mcp_policy.py
+          tests/agent/transports/test_hermes_tools_mcp_server.py
+          tests/agent/transports/test_hermes_tools_mcp_agent_loop_routing.py
+          tests/tools/test_registry.py
+
+      - name: Ruff boundary files
+        run: >-
+          uv run ruff check
+          tools/registry.py
+          model_tools.py
+          agent/transports/hermes_tools_mcp_server.py
+          tests/agent/transports/test_mcp_preexecution_boundary.py
+
+      - name: Create executable sentinels for real stdio smoke
+        shell: bash
+        run: |
+          cat > tools/zz_mcp_policy_probe_sentinel.py <<'PY'
+          import os
+          from pathlib import Path
+          from tools.registry import registry
+
+          def _probe():
+              target = os.environ.get("MCP_CHECK_SENTINEL_PATH", "")
+              if target:
+                  Path(target).write_text("check_fn executed", encoding="utf-8")
+              return True
+
+          registry.register(
+              name="mcp_probe_unsafe",
+              toolset="terminal",
+              schema={
+                  "name": "mcp_probe_unsafe",
+                  "description": "Validation-only unsafe availability probe sentinel.",
+                  "parameters": {"type": "object", "properties": {}},
+              },
+              handler=lambda args, **kw: "ok",
+              check_fn=_probe,
+          )
+          PY
+
+          for mode in safe trusted; do
+            home="$RUNNER_TEMP/hermes-mcp-$mode"
+            mkdir -p "$home/plugins/mcp-sentinel"
+            cat > "$home/config.yaml" <<'YAML'
+          plugins:
+            enabled:
+              - mcp-sentinel
+          YAML
+            cat > "$home/plugins/mcp-sentinel/plugin.yaml" <<'YAML'
+          name: mcp-sentinel
+          version: 1.0.0
+          description: Validation-only import side-effect sentinel
+          YAML
+            cat > "$home/plugins/mcp-sentinel/__init__.py" <<'PY'
+          import os
+          from pathlib import Path
+
+          target = os.environ.get("MCP_PLUGIN_SENTINEL_PATH", "")
+          if target:
+              Path(target).write_text("plugin imported", encoding="utf-8")
+
+          def register(ctx):
+              return None
+          PY
+          done
+
+      - name: Real stdio MCP safe/trusted sentinel smoke
+        shell: bash
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import os
+          import sys
+          from pathlib import Path
+
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          ROOT = Path.cwd()
+          TMP = Path(os.environ["RUNNER_TEMP"])
+
+          async def list_names(label: str, trusted: bool):
+              home = TMP / f"hermes-mcp-{label}"
+              plugin_sentinel = TMP / f"{label}-plugin-imported"
+              check_sentinel = TMP / f"{label}-check-probed"
+              plugin_sentinel.unlink(missing_ok=True)
+              check_sentinel.unlink(missing_ok=True)
+
+              env = dict(os.environ)
+              env.update({
+                  "HERMES_HOME": str(home),
+                  "HERMES_MCP_MODE": "full",
+                  "HERMES_MCP_ALLOW_NATIVE_EXECUTION": "true" if trusted else "false",
+                  "HERMES_MCP_DISCOVER_EXTERNAL": "false",
+                  "MCP_PLUGIN_SENTINEL_PATH": str(plugin_sentinel),
+                  "MCP_CHECK_SENTINEL_PATH": str(check_sentinel),
+                  "PYTHONPATH": str(ROOT) + os.pathsep + env.get("PYTHONPATH", ""),
+              })
+              params = StdioServerParameters(
+                  command=sys.executable,
+                  args=["-m", "agent.transports.hermes_tools_mcp_server"],
+                  env=env,
+                  cwd=str(ROOT),
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      result = await session.list_tools()
+              names = {tool.name for tool in result.tools}
+              return names, plugin_sentinel.exists(), check_sentinel.exists()
+
+          async def main():
+              safe_names, safe_plugin, safe_check = await list_names("safe", trusted=False)
+              assert "mcp_probe_unsafe" not in safe_names, safe_names
+              assert not safe_plugin, "safe-full imported user plugin code"
+              assert not safe_check, "safe-full executed unsafe availability check_fn"
+              for name in (
+                  "browser_cdp",
+                  "browser_dialog",
+                  "image_generate",
+                  "video_generate",
+                  "skills_list",
+                  "skill_view",
+                  "skill_manage",
+                  "project_list",
+                  "project_create",
+                  "project_switch",
+              ):
+                  assert name not in safe_names, f"safe-full exposed {name}"
+              print(f"MCP_STDIO_SAFE_PREEXECUTION_OK count={len(safe_names)}")
+
+              trusted_names, trusted_plugin, trusted_check = await list_names("trusted", trusted=True)
+              assert "mcp_probe_unsafe" in trusted_names, trusted_names
+              assert trusted_plugin, "trusted-full did not execute enabled plugin discovery"
+              assert trusted_check, "trusted-full did not execute sentinel availability check_fn"
+              print(f"MCP_STDIO_TRUSTED_PREEXECUTION_OK count={len(trusted_names)}")
+
+          asyncio.run(main())
+          PY
+
+      - name: Remove validation-only artifacts and commit source patch
+        shell: bash
+        run: |
+          rm -f tools/zz_mcp_policy_probe_sentinel.py
+          git rm scripts/_apply_mcp_import_state_guard.py .github/workflows/_mcp_import_state_stdio.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add model_tools.py agent/transports/hermes_tools_mcp_server.py tests/agent/transports/test_mcp_preexecution_boundary.py
+          git commit -m "fix(mcp): fail closed on prior permissive tool import"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
