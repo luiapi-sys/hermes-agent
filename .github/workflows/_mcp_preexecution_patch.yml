@@ -28,7 +28,9 @@ jobs:
           enable-cache: true
 
       - name: Apply exact-context source patch
-        run: python scripts/_apply_mcp_preexecution_boundary.py
+        run: |
+          python scripts/_apply_mcp_preexecution_boundary.py
+          python scripts/_fix_mcp_patch_compat.py
 
       - name: Install Python dependencies
         run: uv sync --frozen --extra dev
@@ -63,7 +65,7 @@ jobs:
 
       - name: Remove one-shot harness and commit validated patch
         run: |
-          git rm scripts/_apply_mcp_preexecution_boundary.py .github/workflows/_mcp_preexecution_patch.yml
+          git rm scripts/_apply_mcp_preexecution_boundary.py scripts/_fix_mcp_patch_compat.py .github/workflows/_mcp_preexecution_patch.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add tools/registry.py model_tools.py agent/transports/hermes_tools_mcp_server.py tests/agent/transports/test_mcp_preexecution_boundary.py
