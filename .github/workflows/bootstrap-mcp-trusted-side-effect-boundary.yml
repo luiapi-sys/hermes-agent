@@ -22,16 +22,64 @@ jobs:
       - name: Run capability hardening script from one-shot workflow
         shell: bash
         run: |
-          ruby - <<'RUBY'
-          require "yaml"
-          path = ".github/workflows/apply-mcp-trusted-side-effect-boundary.yml"
-          doc = YAML.load_file(path)
-          steps = doc.fetch("jobs").fetch("apply-and-test").fetch("steps")
-          step = steps.find { |s| s["name"] == "Apply capability hardening" }
-          raise "Apply capability hardening step not found" unless step && step["run"]
-          File.write("/tmp/apply-capability-hardening.sh", step["run"])
-          RUBY
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          path = Path(".github/workflows/apply-mcp-trusted-side-effect-boundary.yml")
+          text = path.read_text()
+          start_marker = "      - name: Apply capability hardening\n        shell: bash\n        run: |\n"
+          end_marker = "\n      - name: Remove one-shot workflow from resulting commit\n"
+          assert text.count(start_marker) == 1, "apply-step start marker changed"
+          start = text.index(start_marker) + len(start_marker)
+          end = text.index(end_marker, start)
+          script = textwrap.dedent(text[start:end])
+          assert script.startswith("python - <<'PY'\n"), "unexpected apply script start"
+          Path("/tmp/apply-capability-hardening.sh").write_text(script)
+          PY
           bash /tmp/apply-capability-hardening.sh
+
+      - name: Close safe-to-trusted plugin-discovery state leak
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("agent/transports/hermes_tools_mcp_server.py")
+          text = path.read_text()
+          old = '''    if not allow_native_execution:
+              os.environ["HERMES_SKIP_PLUGIN_DISCOVERY"] = "1"
+
+          from model_tools import get_tool_definitions, handle_function_call
+          '''
+          new = '''    if not allow_native_execution:
+              os.environ["HERMES_SKIP_PLUGIN_DISCOVERY"] = "1"
+          else:
+              os.environ.pop("HERMES_SKIP_PLUGIN_DISCOVERY", None)
+
+          from model_tools import get_tool_definitions, handle_function_call
+
+          # model_tools may already be cached from a prior safe build in the same
+          # process. Re-run idempotent plugin discovery after trust is enabled so
+          # safe -> trusted transitions restore the explicitly trusted surface.
+          if allow_native_execution:
+              try:
+                  from hermes_cli.plugins import discover_plugins
+
+                  discover_plugins()
+              except Exception as exc:
+                  logger.debug("Trusted MCP plugin discovery failed: %s", exc)
+          '''
+          assert text.count(old) == 1, "plugin-discovery policy block changed"
+          path.write_text(text.replace(old, new, 1))
+
+          test_path = Path("tests/agent/transports/test_hermes_tools_mcp_trust_boundary.py")
+          test_text = test_path.read_text()
+          test_text += '''\n\ndef test_trusted_policy_clears_safe_plugin_discovery_suppression():\n    source = Path(\"agent/transports/hermes_tools_mcp_server.py\").read_text()\n    assert 'os.environ.pop(\"HERMES_SKIP_PLUGIN_DISCOVERY\", None)' in source\n    assert \"if allow_native_execution:\\n        try:\\n            from hermes_cli.plugins import discover_plugins\" in source\n'''
+          if "from pathlib import Path\n" not in test_text:
+              test_text = "from pathlib import Path\n" + test_text
+          test_path.write_text(test_text)
+          PY
 
       - name: Remove bootstrap workflows from resulting diff
         run: |
