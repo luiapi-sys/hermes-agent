@@ -32,7 +32,7 @@ import logging
 import os
 import sys
 import threading
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +126,7 @@ class _DelegateParentContext:
         self._subagent_id = None
         self._delegate_spinner = None
         self.tool_progress_callback = None
-        self._print_fn = lambda *a, **k: print(*a, file=sys.stderr, **k)
+        self._print_fn = self._safe_print
 
         self._active_children: list[Any] = []
         self._active_children_lock = threading.RLock()
