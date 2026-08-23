@@ -1,4 +1,4 @@
-"""Fixtures shared across hermes_cli kanban tests."""
+"""Fixtures shared across hermes_cli tests."""
 
 from __future__ import annotations
 
@@ -17,6 +17,31 @@ def all_assignees_spawnable(monkeypatch):
     """
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_openrouter_manifest_for_fetch_tests(request, monkeypatch):
+    """Keep OpenRouter fetch unit tests independent of the deployed manifest.
+
+    ``fetch_openrouter_models`` intentionally prefers the remotely-hosted
+    curated manifest over the in-repo snapshot. Tests that exercise live
+    ``/v1/models`` filtering must therefore pin that separate catalog input or
+    their expected IDs change whenever the deployed manifest rotates.
+
+    Scope the default only to ``TestFetchOpenRouterModels``. Individual tests
+    remain free to override ``get_curated_openrouter_models`` explicitly when
+    they need to exercise a different manifest result.
+    """
+    node_path = str(getattr(request.node, "path", "")).replace("\\", "/")
+    node_cls = getattr(request.node, "cls", None)
+    if not node_path.endswith("tests/hermes_cli/test_models.py"):
+        return
+    if getattr(node_cls, "__name__", "") != "TestFetchOpenRouterModels":
+        return
+
+    from hermes_cli import model_catalog
+
+    monkeypatch.setattr(model_catalog, "get_curated_openrouter_models", lambda: [])
 
 
 @pytest.fixture(autouse=True)
