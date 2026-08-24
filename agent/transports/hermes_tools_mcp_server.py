@@ -71,6 +71,8 @@ _MCP_UNSAFE_CAPABILITIES: frozenset[str] = frozenset(
         ToolCapability.SPAWN_AGENT,
         ToolCapability.SPAWN_WORKER,
         ToolCapability.EXTERNAL_MCP,
+        ToolCapability.REMOTE_MUTATION,
+        ToolCapability.PLUGIN_CODE,
     }
 )
 
@@ -333,12 +335,28 @@ def _build_server() -> Any:
             f"hermes-tools MCP server requires the 'mcp' package: {exc}"
         ) from exc
 
-    from model_tools import get_tool_definitions, handle_function_call
-
     mcp_config = _load_hermes_tools_config()
     mode = _resolve_mcp_mode(config=mcp_config)
     discover_external = _resolve_discover_external(config=mcp_config)
     allow_native_execution = _resolve_allow_native_execution(config=mcp_config)
+
+    # Plugin import executes user/project/pip code. Resolve trust first and
+    # suppress plugin discovery before importing model_tools unless this MCP
+    # process has the explicit trusted execution opt-in.
+    if not allow_native_execution:
+        os.environ["HERMES_SKIP_PLUGIN_DISCOVERY"] = "1"
+    else:
+        os.environ.pop("HERMES_SKIP_PLUGIN_DISCOVERY", None)
+
+    from model_tools import get_tool_definitions, handle_function_call
+
+    if allow_native_execution:
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+        except Exception as exc:
+            logger.debug("Trusted MCP plugin discovery failed: %s", exc)
 
     mcp = FastMCP(
         "hermes-tools",
@@ -365,13 +383,17 @@ def _build_server() -> Any:
     # Always request the raw pre-Tool-Search catalog. Otherwise progressive
     # disclosure can replace real tools with tool_search/tool_describe/tool_call
     # before this MCP adapter gets a chance to expose them.
+    definition_kwargs = {
+        "quiet_mode": True,
+        "skip_tool_search_assembly": True,
+    }
+    if not allow_native_execution:
+        definition_kwargs["excluded_capabilities"] = set(_MCP_UNSAFE_CAPABILITIES)
+
     all_defs = {
         td["function"]["name"]: td["function"]
         for td in (
-            get_tool_definitions(
-                quiet_mode=True,
-                skip_tool_search_assembly=True,
-            )
+            get_tool_definitions(**definition_kwargs)
             or []
         )
         if (

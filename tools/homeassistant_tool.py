@@ -474,7 +474,7 @@ HA_CALL_SERVICE_SCHEMA = {
 # Registration
 # ---------------------------------------------------------------------------
 
-from tools.registry import registry, tool_error
+from tools.registry import ToolCapability, registry, tool_error
 
 registry.register(
     name="ha_list_entities",
@@ -509,5 +509,6 @@ registry.register(
     schema=HA_CALL_SERVICE_SCHEMA,
     handler=_handle_call_service,
     check_fn=_check_ha_available,
+    capabilities={ToolCapability.REMOTE_MUTATION},
     emoji="🏠",
 )

@@ -2081,6 +2081,7 @@ registry.register(
     schema=KANBAN_BLOCK_SCHEMA,
     handler=_handle_block,
     check_fn=_check_kanban_mode,
+    capabilities={ToolCapability.SPAWN_WORKER},
     emoji="⏸",
 )
 
@@ -2090,6 +2091,7 @@ registry.register(
     schema=KANBAN_HEARTBEAT_SCHEMA,
     handler=_handle_heartbeat,
     check_fn=_check_kanban_mode,
+    capabilities={ToolCapability.SPAWN_WORKER, ToolCapability.PROCESS_CONTROL},
     emoji="💓",
 )
 
@@ -2099,6 +2101,7 @@ registry.register(
     schema=KANBAN_COMMENT_SCHEMA,
     handler=_handle_comment,
     check_fn=_check_kanban_mode,
+    capabilities={ToolCapability.SPAWN_WORKER},
     emoji="💬",
 )
 
@@ -2108,6 +2111,7 @@ registry.register(
     schema=KANBAN_ATTACH_SCHEMA,
     handler=_handle_attach,
     check_fn=_check_kanban_mode,
+    capabilities={ToolCapability.FILESYSTEM_ACCESS},
     emoji="📎",
 )
 
@@ -2117,6 +2121,7 @@ registry.register(
     schema=KANBAN_ATTACH_URL_SCHEMA,
     handler=_handle_attach_url,
     check_fn=_check_kanban_mode,
+    capabilities={ToolCapability.FILESYSTEM_ACCESS},
     emoji="📎",
 )
 
@@ -2155,5 +2160,6 @@ registry.register(
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
     check_fn=_check_kanban_mode,
+    capabilities={ToolCapability.SPAWN_WORKER},
     emoji="🔗",
 )

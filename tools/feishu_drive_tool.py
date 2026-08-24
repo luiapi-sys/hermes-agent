@@ -9,7 +9,7 @@ import json
 import logging
 import threading
 
-from tools.registry import registry, tool_error, tool_result
+from tools.registry import ToolCapability, registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +414,7 @@ registry.register(
     check_fn=_check_feishu,
     requires_env=[],
     is_async=False,
+    capabilities={ToolCapability.REMOTE_MUTATION},
     description="Reply to a document comment",
     emoji="\u2709\ufe0f",
 )
@@ -426,6 +427,7 @@ registry.register(
     check_fn=_check_feishu,
     requires_env=[],
     is_async=False,
+    capabilities={ToolCapability.REMOTE_MUTATION},
     description="Add a whole-document comment",
     emoji="\u2709\ufe0f",
 )

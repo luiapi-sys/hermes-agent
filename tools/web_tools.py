@@ -1165,7 +1165,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry, tool_error
+from tools.registry import ToolCapability, registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
@@ -1233,6 +1233,7 @@ registry.register(
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     is_async=True,
+    capabilities={ToolCapability.FILESYSTEM_ACCESS},
     emoji="📄",
     max_result_size_chars=100_000,
 )
