@@ -34,15 +34,15 @@ jobs:
 
           replace_once(
               "hermes_cli/plugins.py",
-              "def discover_plugins() -> list[PluginInfo]:\n    global _plugins_discovered\n    with _discovery_lock:\n",
-              "def discover_plugins() -> list[PluginInfo]:\n    global _plugins_discovered\n    if os.environ.get(\"HERMES_SKIP_PLUGIN_DISCOVERY\"):\n        logger.debug(\"Plugin discovery suppressed by HERMES_SKIP_PLUGIN_DISCOVERY\")\n        return []\n    with _discovery_lock:\n",
-              "discover_plugins suppression",
+              "def discover_plugins(force: bool = False) -> None:\n    \"\"\"Discover and load all plugins.\n\n    Default behavior is idempotent. Pass ``force=True`` to rescan plugin\n    manifests and reload state in the current process.\n    \"\"\"\n    get_plugin_manager().discover_and_load(force=force)\n",
+              "def discover_plugins(force: bool = False) -> None:\n    \"\"\"Discover and load all plugins.\n\n    Default behavior is idempotent. Pass ``force=True`` to rescan plugin\n    manifests and reload state in the current process.\n    \"\"\"\n    if os.environ.get(\"HERMES_SKIP_PLUGIN_DISCOVERY\"):\n        logger.debug(\"Plugin discovery suppressed by HERMES_SKIP_PLUGIN_DISCOVERY\")\n        return\n    get_plugin_manager().discover_and_load(force=force)\n",
+              "public plugin discovery suppression",
           )
           replace_once(
               "hermes_cli/plugins.py",
-              "def _ensure_plugins_discovered() -> None:\n    if _plugins_discovered:\n        return\n    discover_plugins()\n",
-              "def _ensure_plugins_discovered() -> None:\n    if os.environ.get(\"HERMES_SKIP_PLUGIN_DISCOVERY\"):\n        return\n    if _plugins_discovered:\n        return\n    discover_plugins()\n",
-              "ensure plugin suppression",
+              "        if self._discovered and not force:\n            return\n        if env_var_enabled(\"HERMES_SAFE_MODE\"):\n",
+              "        if os.environ.get(\"HERMES_SKIP_PLUGIN_DISCOVERY\"):\n            logger.info(\"HERMES_SKIP_PLUGIN_DISCOVERY=1 — plugin discovery skipped\")\n            return\n        if self._discovered and not force:\n            return\n        if env_var_enabled(\"HERMES_SAFE_MODE\"):\n",
+              "manager plugin discovery suppression",
           )
 
           replace_once(
@@ -105,18 +105,19 @@ jobs:
               "    import hermes_cli.plugins as plugins\n"
               "\n"
               "    monkeypatch.setenv(\"HERMES_SKIP_PLUGIN_DISCOVERY\", \"1\")\n"
-              "    monkeypatch.setattr(plugins, \"_plugins_discovered\", False)\n"
               "\n"
               "    def explode(*args, **kwargs):\n"
               "        raise AssertionError(\n"
               "            \"plugin discovery backend executed while suppressed\"\n"
               "        )\n"
               "\n"
-              "    monkeypatch.setattr(plugins, \"_discover_directory\", explode)\n"
-              "    assert plugins.discover_plugins() == []\n"
-              "    assert plugins._plugins_discovered is False\n"
-              "    plugins._ensure_plugins_discovered()\n"
-              "    assert plugins._plugins_discovered is False\n"
+              "    monkeypatch.setattr(plugins, \"get_plugin_manager\", explode)\n"
+              "    assert plugins.discover_plugins() is None\n"
+              "\n"
+              "    manager = plugins.PluginManager()\n"
+              "    monkeypatch.setattr(manager, \"_discover_and_load_inner\", explode)\n"
+              "    manager.discover_and_load()\n"
+              "    assert manager._discovered is False\n"
               "\n\n"
               "def test_plugin_defined_handler_is_automatically_unsafe():\n"
               "    registry = ToolRegistry()\n"
