@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - validate/mcp-final-e24aa05d
+  pull_request:
+    branches:
+      - fix/mcp-full-policy-hardening
 
 permissions:
   contents: read
