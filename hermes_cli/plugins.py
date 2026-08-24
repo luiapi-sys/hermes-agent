@@ -1302,6 +1302,9 @@ class PluginManager:
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
+        if os.environ.get("HERMES_SKIP_PLUGIN_DISCOVERY"):
+            logger.info("HERMES_SKIP_PLUGIN_DISCOVERY=1 — plugin discovery skipped")
+            return
         if self._discovered and not force:
             return
         if env_var_enabled("HERMES_SAFE_MODE"):
@@ -2062,6 +2065,9 @@ def discover_plugins(force: bool = False) -> None:
     Default behavior is idempotent. Pass ``force=True`` to rescan plugin
     manifests and reload state in the current process.
     """
+    if os.environ.get("HERMES_SKIP_PLUGIN_DISCOVERY"):
+        logger.debug("Plugin discovery suppressed by HERMES_SKIP_PLUGIN_DISCOVERY")
+        return
     get_plugin_manager().discover_and_load(force=force)
 
 

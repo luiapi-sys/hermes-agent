@@ -43,6 +43,7 @@ class ToolCapability:
     SPAWN_WORKER = "spawn_worker"
     EXTERNAL_MCP = "external_mcp"
     REMOTE_MUTATION = "remote_mutation"
+    PLUGIN_CODE = "plugin_code"
 
 
 _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
@@ -74,8 +75,14 @@ _TOOLSET_DEFAULT_CAPABILITIES: Dict[str, frozenset[str]] = {
         }
     ),
     "vision": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
-    "video": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "video_gen": frozenset(
+        {ToolCapability.FILESYSTEM_ACCESS, ToolCapability.REMOTE_MUTATION}
+    ),
     "image_gen": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "memory": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "session_search": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "skills": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
+    "project": frozenset({ToolCapability.FILESYSTEM_ACCESS}),
 }
 
 
@@ -448,6 +455,14 @@ class ToolRegistry:
         resolved_capabilities = frozenset(
             _TOOLSET_DEFAULT_CAPABILITIES.get(toolset, frozenset())
         ).union(capabilities or ())
+        caller_mod = self._caller_module()
+        if (
+            self._plugin_owner_of(handler) is not None
+            or caller_mod.startswith("hermes_plugins.")
+        ):
+            resolved_capabilities = resolved_capabilities.union(
+                {ToolCapability.PLUGIN_CODE}
+            )
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:

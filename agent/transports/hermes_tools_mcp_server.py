@@ -72,6 +72,7 @@ _MCP_UNSAFE_CAPABILITIES: frozenset[str] = frozenset(
         ToolCapability.SPAWN_WORKER,
         ToolCapability.EXTERNAL_MCP,
         ToolCapability.REMOTE_MUTATION,
+        ToolCapability.PLUGIN_CODE,
     }
 )
 

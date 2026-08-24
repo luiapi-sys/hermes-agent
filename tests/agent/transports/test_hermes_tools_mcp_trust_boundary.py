@@ -23,7 +23,14 @@ def test_unsafe_toolsets_inherit_trust_boundary_capabilities():
         "browser-cdp": {ToolCapability.UI_AUTOMATION, ToolCapability.FILESYSTEM_ACCESS},
         "tts": {ToolCapability.FILESYSTEM_ACCESS, ToolCapability.HOST_EXECUTION, ToolCapability.PROCESS_CONTROL},
         "vision": {ToolCapability.FILESYSTEM_ACCESS},
-        "video": {ToolCapability.FILESYSTEM_ACCESS},
+        "video_gen": {
+            ToolCapability.FILESYSTEM_ACCESS,
+            ToolCapability.REMOTE_MUTATION,
+        },
+        "memory": {ToolCapability.FILESYSTEM_ACCESS},
+        "session_search": {ToolCapability.FILESYSTEM_ACCESS},
+        "skills": {ToolCapability.FILESYSTEM_ACCESS},
+        "project": {ToolCapability.FILESYSTEM_ACCESS},
         "image_gen": {ToolCapability.FILESYSTEM_ACCESS},
     }
     for index, (toolset, expected) in enumerate(cases.items()):
@@ -106,3 +113,56 @@ def test_trusted_policy_clears_safe_plugin_discovery_suppression():
     source = Path("agent/transports/hermes_tools_mcp_server.py").read_text()
     assert 'os.environ.pop("HERMES_SKIP_PLUGIN_DISCOVERY", None)' in source
     assert "if allow_native_execution:\n        try:\n            from hermes_cli.plugins import discover_plugins" in source
+
+
+def test_plugin_discovery_backend_honors_suppression(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    monkeypatch.setenv("HERMES_SKIP_PLUGIN_DISCOVERY", "1")
+
+    def explode(*args, **kwargs):
+        raise AssertionError(
+            "plugin discovery backend executed while suppressed"
+        )
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", explode)
+    assert plugins.discover_plugins() is None
+
+    manager = plugins.PluginManager()
+    monkeypatch.setattr(manager, "_discover_and_load_inner", explode)
+    manager.discover_and_load()
+    assert manager._discovered is False
+
+
+def test_plugin_defined_handler_is_automatically_unsafe():
+    registry = ToolRegistry()
+    namespace = {"__name__": "hermes_plugins.security_probe"}
+    exec("def handler(args, **kwargs):\n    return 'ok'", namespace)
+    registry.register(
+        name="plugin_probe",
+        toolset="custom",
+        schema={
+            "name": "plugin_probe",
+            "description": "probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=namespace["handler"],
+    )
+    assert (
+        ToolCapability.PLUGIN_CODE
+        in registry.get_tool_capabilities("plugin_probe")
+    )
+
+
+def test_web_extract_is_filesystem_backed_but_web_search_is_not():
+    import tools.web_tools  # noqa: F401
+    from tools.registry import registry
+
+    assert (
+        ToolCapability.FILESYSTEM_ACCESS
+        in registry.get_tool_capabilities("web_extract")
+    )
+    assert (
+        ToolCapability.FILESYSTEM_ACCESS
+        not in registry.get_tool_capabilities("web_search")
+    )
