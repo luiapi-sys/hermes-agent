@@ -1,0 +1,442 @@
+name: Apply MCP final security hardening
+
+on:
+  push:
+    branches:
+      - fix/mcp-final-unclassified-surface
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/mcp-final-unclassified-surface
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv and dev dependencies
+        run: |
+          python -m pip install --disable-pip-version-check uv
+          uv sync --extra dev
+
+      - name: Apply fail-closed MCP capability hardening
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(path: str, old: str, new: str, label: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              count = text.count(old)
+              assert count == 1, f"{label}: expected one exact match, got {count}"
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          def ensure_toolcap_import(path: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if re.search(r"from tools\.registry import [^\n]*\bToolCapability\b", text):
+                  return
+              pattern = r"from tools\.registry import ([^\n]+)"
+              match = re.search(pattern, text)
+              assert match, f"{path}: tools.registry import not found"
+              replacement = f"from tools.registry import ToolCapability, {match.group(1)}"
+              text = text[:match.start()] + replacement + text[match.end():]
+              p.write_text(text, encoding="utf-8")
+
+          def tag_registration(path: str, tool_name: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              pattern = re.compile(
+                  rf'(name=["\']{re.escape(tool_name)}["\'],\n(?P<indent>\s*)toolset=[^\n]+,\n)'
+              )
+              matches = list(pattern.finditer(text))
+              assert len(matches) == 1, (
+                  f"{path}:{tool_name}: expected one name/toolset registration, got {len(matches)}"
+              )
+              match = matches[0]
+              insert = match.group(0) + (
+                  f"{match.group('indent')}capabilities={{ToolCapability.EXTERNAL_SIDE_EFFECT}},\n"
+              )
+              text = text[:match.start()] + insert + text[match.end():]
+              p.write_text(text, encoding="utf-8")
+
+          # 1) Registry security vocabulary and toolset defaults.
+          replace_once(
+              "tools/registry.py",
+              '    EXTERNAL_MCP = "external_mcp"\n',
+              '    EXTERNAL_MCP = "external_mcp"\n'
+              '    PLUGIN_EXECUTION = "plugin_execution"\n'
+              '    EXTERNAL_SIDE_EFFECT = "external_side_effect"\n',
+              "registry capability constants",
+          )
+          replace_once(
+              "tools/registry.py",
+              '    "cronjob": frozenset({ToolCapability.SPAWN_AGENT}),\n}\n',
+              '    "cronjob": frozenset({ToolCapability.SPAWN_AGENT}),\n'
+              '    "browser": frozenset(\n'
+              '        {\n'
+              '            ToolCapability.UI_AUTOMATION,\n'
+              '            ToolCapability.HOST_EXECUTION,\n'
+              '            ToolCapability.PROCESS_CONTROL,\n'
+              '        }\n'
+              '    ),\n'
+              '    "tts": frozenset(\n'
+              '        {\n'
+              '            ToolCapability.FILESYSTEM_ACCESS,\n'
+              '            ToolCapability.HOST_EXECUTION,\n'
+              '            ToolCapability.PROCESS_CONTROL,\n'
+              '        }\n'
+              '    ),\n'
+              '}\n',
+              "browser/tts capability defaults",
+          )
+          replace_once(
+              "tools/registry.py",
+              '        resolved_capabilities = frozenset(\n'
+              '            _TOOLSET_DEFAULT_CAPABILITIES.get(toolset, frozenset())\n'
+              '        ).union(capabilities or ())\n'
+              '        with self._lock:\n',
+              '        resolved_capabilities = frozenset(\n'
+              '            _TOOLSET_DEFAULT_CAPABILITIES.get(toolset, frozenset())\n'
+              '        ).union(capabilities or ())\n'
+              '        plugin_owner = self._plugin_owner_of(handler)\n'
+              '        plugin_caller = self._caller_module().startswith("hermes_plugins.")\n'
+              '        if plugin_owner or plugin_caller:\n'
+              '            resolved_capabilities = resolved_capabilities.union(\n'
+              '                {ToolCapability.PLUGIN_EXECUTION}\n'
+              '            )\n'
+              '        with self._lock:\n',
+              "automatic plugin-origin capability",
+          )
+
+          # 2) PluginContext is also explicit, covering wrappers/imported handlers.
+          ensure_toolcap_import("hermes_cli/plugins.py")
+          replace_once(
+              "hermes_cli/plugins.py",
+              '            emoji=emoji,\n            override=override,\n',
+              '            emoji=emoji,\n'
+              '            capabilities={ToolCapability.PLUGIN_EXECUTION},\n'
+              '            override=override,\n',
+              "PluginContext capability",
+          )
+
+          # 3) Skip plugin discovery before safe MCP policy takes its registry snapshot.
+          replace_once(
+              "model_tools.py",
+              '# Plugin tool discovery\n'
+              'try:\n'
+              '    from hermes_cli.plugins import discover_plugins\n'
+              '    discover_plugins()\n'
+              'except Exception as e:\n'
+              '    logger.debug("Plugin discovery failed: %s", e)\n',
+              '_PLUGIN_DISCOVERY_SKIP_ENV = "HERMES_SKIP_PLUGIN_DISCOVERY"\n\n'
+              '# Plugin modules are executable Python. Dedicated safe transports can\n'
+              '# suppress discovery before importing model_tools; normal Hermes entry\n'
+              '# points retain the historical discovery behavior.\n'
+              'if os.environ.get(_PLUGIN_DISCOVERY_SKIP_ENV, "").strip().lower() not in {\n'
+              '    "1",\n'
+              '    "true",\n'
+              '    "yes",\n'
+              '    "on",\n'
+              '}:\n'
+              '    try:\n'
+              '        from hermes_cli.plugins import discover_plugins\n\n'
+              '        discover_plugins()\n'
+              '    except Exception as e:\n'
+              '        logger.debug("Plugin discovery failed: %s", e)\n'
+              'else:\n'
+              '    logger.debug("Plugin discovery suppressed by %s", _PLUGIN_DISCOVERY_SKIP_ENV)\n',
+              "model_tools plugin discovery gate",
+          )
+
+          # 4) MCP policy gains plugin/remote-side-effect classes and filters before check_fn.
+          replace_once(
+              "agent/transports/hermes_tools_mcp_server.py",
+              '        ToolCapability.EXTERNAL_MCP,\n',
+              '        ToolCapability.EXTERNAL_MCP,\n'
+              '        ToolCapability.PLUGIN_EXECUTION,\n'
+              '        ToolCapability.EXTERNAL_SIDE_EFFECT,\n',
+              "MCP unsafe capabilities",
+          )
+          replace_once(
+              "agent/transports/hermes_tools_mcp_server.py",
+              '    return EXPOSED_TOOLS\n\n\ndef _discover_external_mcp_tools(\n',
+              '    return EXPOSED_TOOLS\n\n\n'
+              'def _candidate_registry_tool_names(\n'
+              '    *,\n'
+              '    mode: str,\n'
+              '    allow_native_execution: bool,\n'
+              ') -> set[str]:\n'
+              '    """Choose registry names before availability probes run.\n\n'
+              '    Safe full mode removes denied capability classes before\n'
+              '    ``registry.get_definitions()`` can evaluate tool ``check_fn``\n'
+              '    probes. Curated mode preserves its historical allowlist.\n'
+              '    """\n'
+              '    resolved_mode = _resolve_mcp_mode(mode)\n'
+              '    if resolved_mode == MCP_MODE_CURATED:\n'
+              '        return set(EXPOSED_TOOLS)\n\n'
+              '    names = set(registry.get_all_tool_names())\n'
+              '    if allow_native_execution:\n'
+              '        return names\n'
+              '    return {\n'
+              '        name\n'
+              '        for name in names\n'
+              '        if not (\n'
+              '            _MCP_UNSAFE_CAPABILITIES\n'
+              '            & registry.get_tool_capabilities(name)\n'
+              '        )\n'
+              '    }\n\n\n'
+              'def _discover_external_mcp_tools(\n',
+              "candidate prefilter helper",
+          )
+          replace_once(
+              "agent/transports/hermes_tools_mcp_server.py",
+              '    from model_tools import get_tool_definitions, handle_function_call\n\n'
+              '    mcp_config = _load_hermes_tools_config()\n'
+              '    mode = _resolve_mcp_mode(config=mcp_config)\n'
+              '    discover_external = _resolve_discover_external(config=mcp_config)\n'
+              '    allow_native_execution = _resolve_allow_native_execution(config=mcp_config)\n',
+              '    mcp_config = _load_hermes_tools_config()\n'
+              '    mode = _resolve_mcp_mode(config=mcp_config)\n'
+              '    discover_external = _resolve_discover_external(config=mcp_config)\n'
+              '    allow_native_execution = _resolve_allow_native_execution(config=mcp_config)\n\n'
+              '    # model_tools discovers executable plugins at import time. Resolve\n'
+              '    # transport policy first and suppress that side effect for safe\n'
+              '    # startup. Trusted full mode retains normal plugin discovery.\n'
+              '    plugin_skip_env = "HERMES_SKIP_PLUGIN_DISCOVERY"\n'
+              '    previous_plugin_skip = os.environ.get(plugin_skip_env)\n'
+              '    if not allow_native_execution:\n'
+              '        os.environ[plugin_skip_env] = "1"\n'
+              '    try:\n'
+              '        from model_tools import handle_function_call\n'
+              '    finally:\n'
+              '        if not allow_native_execution:\n'
+              '            if previous_plugin_skip is None:\n'
+              '                os.environ.pop(plugin_skip_env, None)\n'
+              '            else:\n'
+              '                os.environ[plugin_skip_env] = previous_plugin_skip\n',
+              "resolve policy before model_tools import",
+          )
+
+          mcp_path = Path("agent/transports/hermes_tools_mcp_server.py")
+          mcp_text = mcp_path.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r'    # Always request the raw pre-Tool-Search catalog\..*?'
+              r'\n    capabilities_by_name = \{',
+              re.DOTALL,
+          )
+          replacement = '''    # Filter registry names by capability before requesting schemas. This is
+    # security-sensitive ordering: availability checks can themselves probe or
+    # spawn host processes, so denied tools must never reach get_definitions().
+    candidate_names = _candidate_registry_tool_names(
+        mode=mode,
+        allow_native_execution=allow_native_execution,
+    )
+    all_defs = {
+        td["function"]["name"]: td["function"]
+        for td in registry.get_definitions(candidate_names, quiet=True)
+        if (
+            isinstance(td, dict)
+            and td.get("type") == "function"
+            and isinstance(td.get("function"), dict)
+            and td["function"].get("name")
+        )
+    }
+
+    capabilities_by_name = {'''
+          mcp_text, count = pattern.subn(replacement, mcp_text, count=1)
+          assert count == 1, f"MCP prefilter block replacement count={count}"
+          mcp_path.write_text(mcp_text, encoding="utf-8")
+
+          # 5) Granular remote-state mutation capability tags.
+          integration_tags = {
+              "tools/homeassistant_tool.py": ["ha_call_service"],
+              "tools/discord_tool.py": ["discord", "discord_admin"],
+              "tools/feishu_drive_tool.py": [
+                  "feishu_drive_reply_comment",
+                  "feishu_drive_add_comment",
+              ],
+              "tools/yuanbao_tools.py": ["yb_send_dm", "yb_send_sticker"],
+          }
+          for path, names in integration_tags.items():
+              ensure_toolcap_import(path)
+              for name in names:
+                  tag_registration(path, name)
+
+          print("MCP_FINAL_HARDENING_PATCH_OK")
+          PY
+
+      - name: Add focused regression tests
+        run: |
+          cat > tests/agent/transports/test_mcp_final_hardening.py <<'PY'
+          from __future__ import annotations
+
+          import importlib
+          import types
+
+          from agent.transports import hermes_tools_mcp_server as mcp_server
+          from tools.registry import ToolCapability, ToolRegistry, registry
+
+
+          def _schema(name: str) -> dict:
+              return {
+                  "name": name,
+                  "description": name,
+                  "parameters": {"type": "object", "properties": {}},
+              }
+
+
+          def _handler() -> str:
+              return "ok"
+
+
+          def test_browser_and_tts_toolsets_inherit_unsafe_capabilities() -> None:
+              local = ToolRegistry()
+              local.register("browser_probe", "browser", _schema("browser_probe"), _handler)
+              local.register("tts_probe", "tts", _schema("tts_probe"), _handler)
+
+              browser_caps = local.get_tool_capabilities("browser_probe")
+              assert ToolCapability.UI_AUTOMATION in browser_caps
+              assert ToolCapability.HOST_EXECUTION in browser_caps
+              assert ToolCapability.PROCESS_CONTROL in browser_caps
+
+              tts_caps = local.get_tool_capabilities("tts_probe")
+              assert ToolCapability.FILESYSTEM_ACCESS in tts_caps
+              assert ToolCapability.HOST_EXECUTION in tts_caps
+              assert ToolCapability.PROCESS_CONTROL in tts_caps
+
+
+          def test_plugin_defined_handler_is_fail_closed_by_origin() -> None:
+              local = ToolRegistry()
+              plugin_globals = {"__name__": "hermes_plugins.security_probe"}
+              plugin_handler = types.FunctionType(_handler.__code__, plugin_globals)
+              local.register(
+                  "plugin_probe",
+                  "plugin-probe",
+                  _schema("plugin_probe"),
+                  plugin_handler,
+              )
+              assert ToolCapability.PLUGIN_EXECUTION in local.get_tool_capabilities(
+                  "plugin_probe"
+              )
+
+
+          def test_safe_full_filters_before_unsafe_check_fn(monkeypatch) -> None:
+              local = ToolRegistry()
+              probes = {"safe": 0, "unsafe": 0}
+
+              def safe_check() -> bool:
+                  probes["safe"] += 1
+                  return True
+
+              def unsafe_check() -> bool:
+                  probes["unsafe"] += 1
+                  raise AssertionError("unsafe availability probe must not execute")
+
+              local.register(
+                  "safe_probe",
+                  "safe-probe",
+                  _schema("safe_probe"),
+                  _handler,
+                  check_fn=safe_check,
+              )
+              local.register(
+                  "unsafe_probe",
+                  "browser",
+                  _schema("unsafe_probe"),
+                  _handler,
+                  check_fn=unsafe_check,
+              )
+              monkeypatch.setattr(mcp_server, "registry", local)
+
+              candidates = mcp_server._candidate_registry_tool_names(
+                  mode=mcp_server.MCP_MODE_FULL,
+                  allow_native_execution=False,
+              )
+              assert "safe_probe" in candidates
+              assert "unsafe_probe" not in candidates
+
+              definitions = local.get_definitions(candidates, quiet=True)
+              assert {item["function"]["name"] for item in definitions} == {"safe_probe"}
+              assert probes == {"safe": 1, "unsafe": 0}
+
+
+          def test_new_capability_classes_are_part_of_mcp_unsafe_set() -> None:
+              assert ToolCapability.PLUGIN_EXECUTION in mcp_server._MCP_UNSAFE_CAPABILITIES
+              assert ToolCapability.EXTERNAL_SIDE_EFFECT in mcp_server._MCP_UNSAFE_CAPABILITIES
+
+
+          def test_mutating_integrations_are_classified_granularly() -> None:
+              for module_name in (
+                  "tools.homeassistant_tool",
+                  "tools.discord_tool",
+                  "tools.feishu_drive_tool",
+                  "tools.yuanbao_tools",
+              ):
+                  importlib.import_module(module_name)
+
+              unsafe = {
+                  "ha_call_service",
+                  "discord",
+                  "discord_admin",
+                  "feishu_drive_reply_comment",
+                  "feishu_drive_add_comment",
+                  "yb_send_dm",
+                  "yb_send_sticker",
+              }
+              read_only = {
+                  "ha_list_entities",
+                  "ha_get_state",
+                  "ha_list_services",
+                  "feishu_drive_list_comments",
+                  "feishu_drive_list_comment_replies",
+                  "yb_query_group_info",
+                  "yb_query_group_members",
+                  "yb_search_sticker",
+              }
+              for name in unsafe:
+                  assert ToolCapability.EXTERNAL_SIDE_EFFECT in registry.get_tool_capabilities(name)
+              for name in read_only:
+                  assert ToolCapability.EXTERNAL_SIDE_EFFECT not in registry.get_tool_capabilities(name)
+          PY
+
+      - name: Run MCP regression suite
+        run: |
+          uv run pytest -q \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/tools/test_mcp_tool.py \
+            tests/agent/transports/test_mcp_final_hardening.py
+
+      - name: Ruff changed security surface
+        run: |
+          uv run ruff check \
+            agent/transports/hermes_tools_mcp_server.py \
+            model_tools.py \
+            hermes_cli/plugins.py \
+            tools/registry.py \
+            tools/homeassistant_tool.py \
+            tools/discord_tool.py \
+            tools/feishu_drive_tool.py \
+            tools/yuanbao_tools.py \
+            tests/agent/transports/test_mcp_final_hardening.py
+
+      - name: Commit validated hardening and remove one-shot workflow
+        run: |
+          rm .github/workflows/apply-mcp-final-hardening.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(mcp): close unclassified execution surfaces"
+          git push origin HEAD:fix/mcp-final-unclassified-surface
