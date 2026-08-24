@@ -1,0 +1,40 @@
+name: Diagnose MCP final hardening
+
+on:
+  pull_request:
+    branches:
+      - fix/mcp-full-policy-hardening
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Watch latest one-shot hardening run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --branch fix/mcp-final-unclassified-surface \
+            --workflow "Apply MCP final security hardening" \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')"
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "No one-shot hardening run found" >&2
+            exit 1
+          fi
+          echo "ONE_SHOT_RUN_ID=$run_id"
+          gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json status,conclusion,url
+          if ! gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status; then
+            echo "--- failed logs ---"
+            gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --log-failed || true
+            exit 1
+          fi
+          echo "ONE_SHOT_HARDENING_OK run=$run_id"
