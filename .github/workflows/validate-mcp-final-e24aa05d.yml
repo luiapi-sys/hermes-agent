@@ -1,0 +1,175 @@
+name: Validate MCP final e24aa05d
+
+on:
+  push:
+    branches:
+      - validate/mcp-final-e24aa05d
+
+permissions:
+  contents: read
+
+jobs:
+  final-mcp-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact validation branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv and dev dependencies
+        run: |
+          python -m pip install --disable-pip-version-check uv
+          uv sync --extra dev
+
+      - name: Run targeted MCP policy tests
+        run: |
+          uv run pytest -q \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/tools/test_mcp_tool.py
+          uv run ruff check \
+            agent/transports/hermes_tools_mcp_server.py \
+            tools/registry.py \
+            tools/mcp_tool.py \
+            tests/agent/transports/test_hermes_tools_mcp_policy.py \
+            tests/tools/test_mcp_tool.py
+
+      - name: Prepare fake external stdio MCP server
+        run: |
+          cat > /tmp/fake_ext_mcp.py <<'PY'
+          from pathlib import Path
+          from mcp.server.fastmcp import FastMCP
+
+          Path('/tmp/hermes-ext-started').write_text('started', encoding='utf-8')
+
+          app = FastMCP('hermes-final-smoke-external')
+
+          @app.tool()
+          def ext_echo(text: str) -> str:
+              return f'ext:{text}'
+
+          if __name__ == '__main__':
+              app.run(transport='stdio')
+          PY
+
+          mkdir -p "$HOME/.hermes"
+          cat > "$HOME/.hermes/config.yaml" <<YAML
+          mcp_servers:
+            final_smoke:
+              command: "${{ github.workspace }}/.venv/bin/python"
+              args:
+                - "/tmp/fake_ext_mcp.py"
+              connect_timeout: 20
+              timeout: 30
+          YAML
+
+      - name: Real stdio safe and trusted MCP smoke
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import os
+          import sys
+          from pathlib import Path
+
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          MARKER = Path('/tmp/hermes-ext-started')
+          DANGEROUS = {
+              'terminal',
+              'process',
+              'read_file',
+              'write_file',
+              'patch',
+              'search_files',
+              'execute_code',
+              'computer_use',
+              'delegate_task',
+              'cronjob',
+              'kanban_create',
+              'kanban_unblock',
+              'kanban_complete',
+          }
+
+          def result_text(result):
+              return '\n'.join(
+                  getattr(item, 'text', '')
+                  for item in getattr(result, 'content', [])
+                  if getattr(item, 'text', None) is not None
+              )
+
+          async def inspect_case(native: bool):
+              env = dict(os.environ)
+              env.update(
+                  HERMES_MCP_MODE='full',
+                  HERMES_MCP_DISCOVER_EXTERNAL='1',
+                  HERMES_MCP_ALLOW_NATIVE_EXECUTION='1' if native else '0',
+              )
+              params = StdioServerParameters(
+                  command=sys.executable,
+                  args=['-m', 'agent.transports.hermes_tools_mcp_server'],
+                  env=env,
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      listed = await session.list_tools()
+                      tools = list(listed.tools)
+                      names = {tool.name for tool in tools}
+
+                      if not native:
+                          leaked = sorted(DANGEROUS & names)
+                          assert not leaked, f'unsafe tools exposed in safe-full: {leaked}'
+                          assert not any(name == 'ext_echo' or name.endswith('ext_echo') for name in names), names
+                          return names
+
+                      assert DANGEROUS <= names, f'trusted-full missing native/spawn tools: {sorted(DANGEROUS - names)}'
+                      ext_name = next(
+                          (name for name in names if name == 'ext_echo' or name.endswith('ext_echo')),
+                          None,
+                      )
+                      assert ext_name, f'external ext_echo missing from trusted-full: {sorted(names)}'
+                      ext_result = await session.call_tool(ext_name, {'text': 'ping'})
+                      assert 'ext:ping' in result_text(ext_result), result_text(ext_result)
+
+                      terminal_tool = next(tool for tool in tools if tool.name == 'terminal')
+                      schema = terminal_tool.inputSchema or {}
+                      props = schema.get('properties', {})
+                      if 'command' in props:
+                          terminal_args = {'command': 'printf MCP_NATIVE_OK'}
+                      elif 'cmd' in props:
+                          terminal_args = {'cmd': 'printf MCP_NATIVE_OK'}
+                      else:
+                          raise AssertionError(f'unrecognized terminal schema: {schema}')
+                      terminal_result = await session.call_tool('terminal', terminal_args)
+                      assert 'MCP_NATIVE_OK' in result_text(terminal_result), result_text(terminal_result)
+                      return names
+
+          async def main():
+              MARKER.unlink(missing_ok=True)
+              safe_names = await inspect_case(False)
+              await asyncio.sleep(0.5)
+              assert not MARKER.exists(), 'safe-full spawned configured external stdio MCP process'
+              print(f'SAFE_FULL_OK tools={len(safe_names)} external_spawn=false')
+
+              MARKER.unlink(missing_ok=True)
+              trusted_names = await inspect_case(True)
+              assert MARKER.exists(), 'trusted-full did not spawn configured external stdio MCP process'
+              print(f'TRUSTED_FULL_OK tools={len(trusted_names)} external_spawn=true ext_echo=ok terminal=ok')
+
+          asyncio.run(main())
+          PY
+
+      - name: Assert external MCP capability metadata
+        run: |
+          uv run python - <<'PY'
+          from tools.registry import ToolCapability
+          from agent.transports.hermes_tools_mcp_server import _MCP_UNSAFE_CAPABILITIES
+
+          assert ToolCapability.EXTERNAL_MCP in _MCP_UNSAFE_CAPABILITIES
+          print('EXTERNAL_MCP_CAPABILITY_OK')
+          PY
