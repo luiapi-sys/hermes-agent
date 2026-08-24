@@ -32,7 +32,6 @@ jobs:
               assert count == 1, f"{label}: expected one match, got {count}"
               p.write_text(text.replace(old, new, 1))
 
-          # 1) Make plugin suppression authoritative at the discovery backend.
           replace_once(
               "hermes_cli/plugins.py",
               "def discover_plugins() -> list[PluginInfo]:\n    global _plugins_discovered\n    with _discovery_lock:\n",
@@ -46,7 +45,6 @@ jobs:
               "ensure plugin suppression",
           )
 
-          # 2) Expand capability taxonomy/defaults and auto-tag plugin handlers.
           replace_once(
               "tools/registry.py",
               "    EXTERNAL_MCP = \"external_mcp\"\n    REMOTE_MUTATION = \"remote_mutation\"\n",
@@ -66,7 +64,6 @@ jobs:
               "automatic plugin capability",
           )
 
-          # 3) Safe MCP must exclude plugin-defined handlers too.
           replace_once(
               "agent/transports/hermes_tools_mcp_server.py",
               "        ToolCapability.EXTERNAL_MCP,\n        ToolCapability.REMOTE_MUTATION,\n",
@@ -74,7 +71,6 @@ jobs:
               "MCP plugin-code unsafe capability",
           )
 
-          # 4) Keep network-only web_search available, but block disk-spilling extract.
           replace_once(
               "tools/web_tools.py",
               "from tools.registry import registry, tool_error\n",
@@ -88,55 +84,72 @@ jobs:
               "web_extract filesystem capability",
           )
 
-          # 5) Regression coverage for all three Codex P1 findings plus preload tagging.
           test_path = Path("tests/agent/transports/test_hermes_tools_mcp_trust_boundary.py")
           text = test_path.read_text()
-          text = text.replace(
-              '        "video": {ToolCapability.FILESYSTEM_ACCESS},\n',
-              '        "video_gen": {ToolCapability.FILESYSTEM_ACCESS, ToolCapability.REMOTE_MUTATION},\n'
+          old_case = '        "video": {ToolCapability.FILESYSTEM_ACCESS},\n'
+          new_cases = (
+              '        "video_gen": {\n'
+              '            ToolCapability.FILESYSTEM_ACCESS,\n'
+              '            ToolCapability.REMOTE_MUTATION,\n'
+              '        },\n'
               '        "memory": {ToolCapability.FILESYSTEM_ACCESS},\n'
               '        "session_search": {ToolCapability.FILESYSTEM_ACCESS},\n'
               '        "skills": {ToolCapability.FILESYSTEM_ACCESS},\n'
-              '        "project": {ToolCapability.FILESYSTEM_ACCESS},\n',
-              1,
+              '        "project": {ToolCapability.FILESYSTEM_ACCESS},\n'
           )
-          assert '"video_gen":' in text and '"project":' in text
-          text += '''\n\ndef test_plugin_discovery_backend_honors_suppression(monkeypatch):
-    import hermes_cli.plugins as plugins
-
-    monkeypatch.setenv("HERMES_SKIP_PLUGIN_DISCOVERY", "1")
-    monkeypatch.setattr(plugins, "_plugins_discovered", False)
-
-    def explode(*args, **kwargs):
-        raise AssertionError("plugin discovery backend executed while suppressed")
-
-    monkeypatch.setattr(plugins, "_discover_directory", explode)
-    assert plugins.discover_plugins() == []
-    assert plugins._plugins_discovered is False
-    plugins._ensure_plugins_discovered()
-    assert plugins._plugins_discovered is False
-
-
-def test_plugin_defined_handler_is_automatically_unsafe():
-    registry = ToolRegistry()
-    namespace = {"__name__": "hermes_plugins.security_probe"}
-    exec("def handler(args, **kwargs):\\n    return 'ok'", namespace)
-    registry.register(
-        name="plugin_probe",
-        toolset="custom",
-        schema={"name": "plugin_probe", "description": "probe", "parameters": {"type": "object", "properties": {}}},
-        handler=namespace["handler"],
-    )
-    assert ToolCapability.PLUGIN_CODE in registry.get_tool_capabilities("plugin_probe")
-
-
-def test_web_extract_is_filesystem_backed_but_web_search_is_not():
-    import tools.web_tools  # noqa: F401
-    from tools.registry import registry
-
-    assert ToolCapability.FILESYSTEM_ACCESS in registry.get_tool_capabilities("web_extract")
-    assert ToolCapability.FILESYSTEM_ACCESS not in registry.get_tool_capabilities("web_search")
-'''
+          assert text.count(old_case) == 1, "video trust-boundary test case changed"
+          text = text.replace(old_case, new_cases, 1)
+          text += (
+              "\n\n"
+              "def test_plugin_discovery_backend_honors_suppression(monkeypatch):\n"
+              "    import hermes_cli.plugins as plugins\n"
+              "\n"
+              "    monkeypatch.setenv(\"HERMES_SKIP_PLUGIN_DISCOVERY\", \"1\")\n"
+              "    monkeypatch.setattr(plugins, \"_plugins_discovered\", False)\n"
+              "\n"
+              "    def explode(*args, **kwargs):\n"
+              "        raise AssertionError(\n"
+              "            \"plugin discovery backend executed while suppressed\"\n"
+              "        )\n"
+              "\n"
+              "    monkeypatch.setattr(plugins, \"_discover_directory\", explode)\n"
+              "    assert plugins.discover_plugins() == []\n"
+              "    assert plugins._plugins_discovered is False\n"
+              "    plugins._ensure_plugins_discovered()\n"
+              "    assert plugins._plugins_discovered is False\n"
+              "\n\n"
+              "def test_plugin_defined_handler_is_automatically_unsafe():\n"
+              "    registry = ToolRegistry()\n"
+              "    namespace = {\"__name__\": \"hermes_plugins.security_probe\"}\n"
+              "    exec(\"def handler(args, **kwargs):\\n    return 'ok'\", namespace)\n"
+              "    registry.register(\n"
+              "        name=\"plugin_probe\",\n"
+              "        toolset=\"custom\",\n"
+              "        schema={\n"
+              "            \"name\": \"plugin_probe\",\n"
+              "            \"description\": \"probe\",\n"
+              "            \"parameters\": {\"type\": \"object\", \"properties\": {}},\n"
+              "        },\n"
+              "        handler=namespace[\"handler\"],\n"
+              "    )\n"
+              "    assert (\n"
+              "        ToolCapability.PLUGIN_CODE\n"
+              "        in registry.get_tool_capabilities(\"plugin_probe\")\n"
+              "    )\n"
+              "\n\n"
+              "def test_web_extract_is_filesystem_backed_but_web_search_is_not():\n"
+              "    import tools.web_tools  # noqa: F401\n"
+              "    from tools.registry import registry\n"
+              "\n"
+              "    assert (\n"
+              "        ToolCapability.FILESYSTEM_ACCESS\n"
+              "        in registry.get_tool_capabilities(\"web_extract\")\n"
+              "    )\n"
+              "    assert (\n"
+              "        ToolCapability.FILESYSTEM_ACCESS\n"
+              "        not in registry.get_tool_capabilities(\"web_search\")\n"
+              "    )\n"
+          )
           test_path.write_text(text)
           PY
 
