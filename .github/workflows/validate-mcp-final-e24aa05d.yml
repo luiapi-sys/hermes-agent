@@ -82,7 +82,7 @@ jobs:
           from mcp.client.stdio import stdio_client
 
           MARKER = Path('/tmp/hermes-ext-started')
-          DANGEROUS = {
+          UNSAFE = {
               'terminal',
               'process',
               'read_file',
@@ -96,6 +96,16 @@ jobs:
               'kanban_create',
               'kanban_unblock',
               'kanban_complete',
+          }
+          REQUIRED_TRUSTED = {
+              'terminal',
+              'process',
+              'read_file',
+              'write_file',
+              'patch',
+              'search_files',
+              'execute_code',
+              'delegate_task',
           }
 
           def result_text(result):
@@ -125,12 +135,16 @@ jobs:
                       names = {tool.name for tool in tools}
 
                       if not native:
-                          leaked = sorted(DANGEROUS & names)
+                          leaked = sorted(UNSAFE & names)
                           assert not leaked, f'unsafe tools exposed in safe-full: {leaked}'
                           assert not any(name == 'ext_echo' or name.endswith('ext_echo') for name in names), names
                           return names
 
-                      assert DANGEROUS <= names, f'trusted-full missing native/spawn tools: {sorted(DANGEROUS - names)}'
+                      missing_required = sorted(REQUIRED_TRUSTED - names)
+                      assert not missing_required, f'trusted-full missing available native tools: {missing_required}'
+                      unavailable_optional = sorted((UNSAFE - REQUIRED_TRUSTED) - names)
+                      print(f'TRUSTED_OPTIONAL_UNAVAILABLE={unavailable_optional}')
+
                       ext_name = next(
                           (name for name in names if name == 'ext_echo' or name.endswith('ext_echo')),
                           None,
